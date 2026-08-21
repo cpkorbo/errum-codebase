@@ -26,8 +26,8 @@ const spaceGrotesk = Space_Grotesk({
 });
 
 export const metadata: Metadata = {
-  title: "Errum BD",
-  description: "Errum BD - Official Store",
+  title: "Errum ERP",
+  description: "Errum ERP Management Panel",
 };
 
 export default function RootLayout({

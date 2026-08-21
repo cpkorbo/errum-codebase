@@ -313,11 +313,6 @@ axiosInstance.interceptors.response.use(
             window.dispatchEvent(new Event('customer-auth-changed'));
             window.dispatchEvent(new Event('cart-updated'));
             
-            // Redirect to customer login page if on e-commerce routes
-            const currentPath = window.location.pathname;
-            if (currentPath.startsWith('/e-commerce')) {
-              window.location.href = '/e-commerce/login';
-            }
           }
           
           return Promise.reject(refreshError);
@@ -340,7 +335,7 @@ axiosInstance.interceptors.response.use(
           
           // Redirect to admin login page if not already there
           const currentPath = window.location.pathname;
-          const publicPages = ['/login', '/signup', '/e-commerce', '/catalog', '/'];
+          const publicPages = ['/login', '/signup', '/catalog', '/'];
           
           if (!publicPages.some(page => currentPath.startsWith(page))) {
             window.location.href = '/login';

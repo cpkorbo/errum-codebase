@@ -3,7 +3,6 @@
 import React from 'react';
 import { AuthProvider } from '@/contexts/AuthContext';
 import { ThemeProvider } from '@/contexts/ThemeContext';
-import { CartProvider } from './e-commerce/CartContext';
 import QZTrayLoader from '@/components/QzTrayLoader';
 import ReceiptPreviewModalHost from '@/components/ReceiptPreviewModalHost';
 import GlobalToastHost from '@/components/GlobalToastHost';
@@ -13,13 +12,11 @@ export default function GlobalProviders({ children }: { children: React.ReactNod
   return (
     <AuthProvider>
       <ThemeProvider>
-        <CartProvider>
-          <QZTrayLoader />
-          <ReceiptPreviewModalHost />
-          <GlobalToastHost />
-          <Toaster position="top-right" reverseOrder={false} />
-          {children}
-        </CartProvider>
+        <QZTrayLoader />
+        <ReceiptPreviewModalHost />
+        <GlobalToastHost />
+        <Toaster position="top-right" reverseOrder={false} />
+        {children}
       </ThemeProvider>
     </AuthProvider>
   );

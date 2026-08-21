@@ -1,12 +1,12 @@
 'use client';
 
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTheme } from "@/contexts/ThemeContext";
 import Link from 'next/link';
 import Sidebar from '@/components/Sidebar';
 import Header from '@/components/Header';
 import Lightbox from '@/components/Lightbox';
-import { Copy, Check, Image as ImageIcon, Eye, Link as LinkIcon } from 'lucide-react';
+import { Copy, Check, Image as ImageIcon, Eye } from 'lucide-react';
 import inventoryService, { GlobalInventoryItem } from '@/services/inventoryService';
 import productImageService from '@/services/productImageService';
 import storeService from '@/services/storeService';
@@ -57,10 +57,6 @@ export default function GalleryPage() {
 
   // Track background image loading (so we can show a small hint, without blocking first paint)
   const [imagesPending, setImagesPending] = useState(0);
-
-  const getEcommerceRoute = useMemo(() => {
-    return (productId: number) => `/e-commerce/product/${productId}`;
-  }, []);
 
   // Prevent state updates after unmount (background image workers)
   const isMountedRef = useRef(true);
@@ -595,17 +591,6 @@ export default function GalleryPage() {
                               <Copy className="w-3 h-3 text-gray-600 dark:text-gray-300" />
                             )}
                           </button>
-                          <button
-                            onClick={() => copyText(`/e-commerce/product/${product.product_id}`, `link-${product.product_id}`)}
-                            className="p-1 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700"
-                            title="Copy E-commerce link"
-                          >
-                            {copiedTextKey === `link-${product.product_id}` ? (
-                              <Check className="w-3 h-3 text-gray-900 dark:text-white" />
-                            ) : (
-                              <LinkIcon className="w-3 h-3 text-gray-600 dark:text-gray-300" />
-                            )}
-                          </button>
                         </div>
 
                         {/* Product details shortcut (same destination as Product List -> View Details) */}
@@ -616,15 +601,6 @@ export default function GalleryPage() {
                         >
                           <Eye className="w-3 h-3" />
                           Details
-                        </Link>
-
-                        <Link
-                          href={`/e-commerce/product/${product.product_id}`}
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
-                          title="Open in E-commerce"
-                        >
-                          <LinkIcon className="w-3 h-3" />
-                          E-commerce
                         </Link>
                       </div>
                       

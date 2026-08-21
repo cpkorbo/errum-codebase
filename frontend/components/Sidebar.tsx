@@ -228,9 +228,7 @@ export default function Sidebar({ isOpen: controlledOpen, setIsOpen, toggleSideb
       icon: Settings,
       label: 'Settings',
       subMenu: [
-        { label: 'Homepage Configuration', href: '/settings/homepage' },
         { label: 'Delivery Charge', href: '/settings/delivery-charge' },
-        { label: 'Homepage Visual Builder', href: '/settings/homepage-visual-builder' },
       ],
     },
 

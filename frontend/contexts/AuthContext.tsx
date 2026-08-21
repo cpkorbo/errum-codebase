@@ -133,7 +133,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // Monitor token validity and redirect if expired
   useEffect(() => {
     // Public frontend routes that don't need authentication
-    const publicRoutes = ['/login', '/forgot-password', '/e-commerce', '/catalog'];
+    const publicRoutes = ['/login', '/forgot-password', '/catalog'];
     
     // Check if current path is public (exact match or starts with route/)
     const isPublicRoute = publicRoutes.some(route => 
