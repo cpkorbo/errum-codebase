@@ -1,0 +1,401 @@
+'use client';
+
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+import {
+  LayoutDashboard,
+  Store,
+  FolderTree,
+  Package,
+  ClipboardList,
+  CreditCard,
+  ShoppingCart,
+  Image,
+  X,
+  Menu,
+  AlertTriangle,
+  Truck,
+  Search,
+  History,
+  RotateCcw,
+  Tag,
+  Users,
+  FileText,
+  Settings,
+} from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { useAuth } from '@/contexts/AuthContext';
+import { PAGE_ACCESS } from '@/lib/accessMap';
+// ──────────────────────────────
+// Perfect discriminated union
+// ──────────────────────────────
+type MenuItem =
+  | {
+      icon: React.ComponentType<{ className?: string }>;
+      label: string;
+      href: string;
+    }
+  | {
+      icon: React.ComponentType<{ className?: string }>;
+      label: string;
+      subMenu: { label: string; href: string }[];
+    };
+
+// ──────────────────────────────
+// Props
+// ──────────────────────────────
+interface SidebarProps {
+  isOpen?: boolean;
+  setIsOpen?: (open: boolean) => void;
+  // Backward-compatible props used by a few older pages in this codebase.
+  toggleSidebar?: () => void;
+  darkMode?: boolean;
+}
+
+const SIDEBAR_STORAGE_KEY = 'errum-admin-sidebar-open';
+
+export default function Sidebar({ isOpen: controlledOpen, setIsOpen, toggleSidebar }: SidebarProps) {
+  const pathname = usePathname();
+  const [internalOpen, setInternalOpen] = useState(true);
+  const isOpen = typeof controlledOpen === 'boolean' ? controlledOpen : internalOpen;
+  const setOpen = (open: boolean) => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(open));
+    }
+
+    setInternalOpen(open);
+
+    if (setIsOpen) {
+      setIsOpen(open);
+      return;
+    }
+
+    // Legacy pages passed only toggleSidebar. Keep those pages working.
+    if (toggleSidebar && open !== isOpen) {
+      toggleSidebar();
+    }
+  };
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const saved = window.localStorage.getItem(SIDEBAR_STORAGE_KEY);
+    if (saved === 'true' || saved === 'false') {
+      setOpen(saved === 'true');
+      return;
+    }
+
+    // Desktop should start expanded, mobile should start hidden until the hamburger is tapped.
+    if (window.matchMedia('(min-width: 1024px)').matches) {
+      setOpen(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof controlledOpen !== 'boolean') return;
+    window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(controlledOpen));
+  }, [controlledOpen]);
+  const [openMenu, setOpenMenu] = useState<string | null>(null);
+  const authContext = useAuth();
+  
+  // Destructure with defaults to prevent runtime errors if context is partially missing
+  const { 
+    isRole = () => false, 
+    isSuperAdmin = false, 
+    isLoading = true 
+  } = authContext || {};
+
+  const canAccessHref = (href: string) => {
+    if (isSuperAdmin) return true;
+    if (isLoading) return true;
+    
+    const clean = href.split('?')[0];
+    const allowedRoles = PAGE_ACCESS[clean];
+    
+    if (!allowedRoles) return true; // no mapping = accessible
+    
+    return isRole(allowedRoles);
+  };
+
+  const toggleSubMenu = (label: string) => {
+    setOpenMenu((prev) => (prev === label ? null : label));
+  };
+
+  const menuItems: MenuItem[] = [
+    {
+      icon: LayoutDashboard,
+      label: 'Dashboard',
+      subMenu: [
+        { label: 'Overview', href: '/dashboard' },
+        { label: 'Stores Summary', href: '/dashboard/stores-summary' },
+      ],
+    },
+    {
+      icon: Truck,
+      label: 'Vendor Management',
+      subMenu: [
+        { label: 'Vendor Payment', href: '/vendor' },
+        { label: 'Purchase Order', href: '/purchase-order' },
+        { label: 'Resell Items', href: '/resell' },
+        { label: 'Resell Reports', href: '/resell/reports' },
+      ],
+    },
+    { icon: Store, label: 'Store', href: '/store' },
+    { icon: Store, label: 'Store Assignment', href: '/store-assingment' },
+    { icon: FolderTree, label: 'Category', href: '/category' },
+    { icon: Tag, label: 'Collections', href: '/collections' },
+    { icon: Image, label: 'Gallery', href: '/gallery' },
+    {
+      icon: Package,
+      label: 'Product',
+      subMenu: [
+        { label: 'Field', href: '/product/field' },
+        { label: 'Product List', href: '/product/list' },
+        { label: 'Check Reserve', href: '/product/check-reserve' },
+        { label: 'Archived Products', href: '/product/archived' },
+        { label: 'Batch', href: '/product/batch' },
+      ],
+    },
+    {
+      icon: ClipboardList,
+      label: 'Inventory',
+      subMenu: [
+        { label: 'Manage Stock', href: '/inventory/manage_stock' },
+        { label: 'View Inventory', href: '/inventory/view' },
+        { label: 'View Inventory New', href: '/inventory/view-new' },
+        { label: 'Stock Audit', href: '/inventory/stock-audit' },
+        { label: 'Monthly Rebalance', href: '/inventory/monthly-rebalance' },
+        { label: 'Price Adjustment', href: '/inventory/batch-price-update' },
+        { label: 'Dispatches', href: '/inventory/outlet-stock' },
+        { label: 'Reports', href: '/inventory/reports' },
+      ],
+    },
+    { icon: ShoppingCart, label: 'Offline Sale', href: '/pos' },
+    { icon: ClipboardList, label: 'Offline Sale History', href: '/purchase-history' },
+    { icon: ShoppingCart, label: 'Social Commerce', href: '/social-commerce' },
+    { icon: Package, label: 'Online Order History', href: '/orders' },
+    { icon: CreditCard, label: 'Installments', href: '/orders?view=installments' },
+    { icon: Package, label: 'Online Order Packing', href: '/social-commerce/package' },
+    { icon: Package, label: 'PreOrders', href: '/preorders' },
+    { icon: AlertTriangle, label: 'Extra-Item Management', href: '/extra' },
+    { icon: RotateCcw, label: 'Returns & Exchanges', href: '/returns' },
+    {
+      icon: Tag,
+      label: 'Sales & Campaign',
+      subMenu: [
+        { label: 'Campaigns', href: '/campaigns' },
+        { label: 'Loyalty Card Tracker', href: '/loyalty-card-tracker' },
+      ],
+    },
+    { icon: Search, label: 'Lookup', href: '/lookup' },
+    { icon: History, label: 'Activity Log', href: '/activity-logs' },
+    { icon: CreditCard, label: 'Transaction', href: '/transaction' },
+    {
+      icon: CreditCard,
+      label: 'Accounting',
+      subMenu: [
+        { label: 'Overview', href: '/accounting' },
+        { label: 'Payment Commissions', href: '/accounting/payment-commissions' },
+      ],
+    },
+    {
+      icon: CreditCard,
+      label: 'Cash Sheet',
+      subMenu: [
+        { label: 'Monthly Sheet', href: '/cash-sheet' },
+        { label: 'Summary', href: '/cash-sheet/summary' },
+        { label: 'Branch Costs', href: '/cash-sheet/branch-cost' },
+        { label: 'Admin Panel', href: '/cash-sheet/admin' },
+        { label: 'Owner Panel', href: '/cash-sheet/owner' },
+      ],
+    },
+    {
+      icon: Users,
+      label: 'Human Resources (HRM)',
+      subMenu: [
+        { label: 'Employee Portal', href: '/hrm/my' },
+        { label: 'Branch Management', href: '/hrm/branch' },
+        { label: 'Attendance Logs', href: '/hrm/attendance' },
+        { label: 'Sales Targets', href: '/hrm/sales-targets' },
+        { label: 'Rewards & Fines', href: '/hrm/rewards-fines' },
+        { label: 'Payroll', href: '/hrm/payroll' },
+        { label: 'Employee Passwords', href: '/employees/password' },
+      ],
+    },
+    { icon: CreditCard, label: 'Employee Management', href: '/employees' },
+    {
+      icon: Settings,
+      label: 'Settings',
+      subMenu: [
+        { label: 'Homepage Configuration', href: '/settings/homepage' },
+        { label: 'Delivery Charge', href: '/settings/delivery-charge' },
+        { label: 'Homepage Visual Builder', href: '/settings/homepage-visual-builder' },
+      ],
+    },
+
+
+  ];
+
+  // Filter menu items based on permissions
+  const filteredMenuItems: MenuItem[] = menuItems
+    .map((item) => {
+      if ('subMenu' in item) {
+        const subMenu = item.subMenu.filter((sub) => canAccessHref(sub.href));
+        return subMenu.length ? { ...item, subMenu } : null;
+      }
+
+      // simple link
+      return canAccessHref((item as any).href) ? item : null;
+    })
+    .filter(Boolean) as MenuItem[];
+
+  return (
+    <>
+      {/* Mobile Overlay */}
+      {isOpen && (
+        <div
+          className="fixed inset-0 bg-black/50 z-40 lg:hidden"
+          onClick={() => setOpen(false)}
+        />
+      )}
+
+      {/* Sidebar */}
+      <aside
+        className={`fixed inset-y-0 left-0 z-50 bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 
+          transform transition-all duration-300 ease-in-out overflow-hidden
+          ${isOpen ? 'translate-x-0 w-64' : '-translate-x-full w-64'}
+          lg:translate-x-0 lg:static lg:z-auto lg:flex-shrink-0 ${isOpen ? 'lg:w-64' : 'lg:w-16'} flex flex-col`}
+      >
+        {/* Header */}
+        <div className={`flex items-center ${isOpen ? 'justify-between p-4' : 'justify-center p-3'} border-b border-gray-200 dark:border-gray-700 h-16`}>
+          {isOpen ? (
+            <>
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="w-10 h-10 bg-black dark:bg-white rounded-lg flex items-center justify-center flex-shrink-0">
+                  <span className="text-white dark:text-black font-bold text-xl">E</span>
+                </div>
+                <div className="min-w-0">
+                  <h1 className="font-semibold text-gray-900 dark:text-white truncate">ERP Admin</h1>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 truncate">Management Panel</p>
+                </div>
+              </div>
+
+              <button
+                onClick={() => setOpen(false)}
+                className="hidden lg:inline-flex p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+                title="Collapse sidebar"
+              >
+                <X className="w-5 h-5" />
+              </button>
+
+              <button
+                onClick={() => setOpen(false)}
+                className="lg:hidden p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={() => setOpen(true)}
+              className="hidden lg:inline-flex p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+              title="Expand sidebar"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+          )}
+        </div>
+
+        {/* Scrollable Menu */}
+        <nav className={`flex-1 overflow-y-auto py-4 ${isOpen ? 'px-3' : 'px-2'}`}>
+          {isOpen && (
+            <p className="px-3 mb-3 text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+              Main Menu
+            </p>
+          )}
+
+          <ul className="space-y-1">
+            {filteredMenuItems.map((item) => {
+              const Icon = item.icon;
+              const hasSubMenu = 'subMenu' in item;
+
+              const hrefPath = (href: string) => href.split('?')[0];
+
+              const isActive = hasSubMenu
+                ? item.subMenu.some((sub) => hrefPath(sub.href) === pathname)
+                : 'href' in item && hrefPath(item.href) === pathname;
+
+              const isSubMenuOpen = openMenu === item.label;
+
+              return (
+                <li key={item.label}>
+                  {/* Main Item */}
+                  {hasSubMenu ? (
+                    <button
+                      onClick={() => isOpen && toggleSubMenu(item.label)}
+                      title={item.label}
+                      className={`w-full flex items-center ${isOpen ? 'justify-between gap-3 px-3' : 'justify-center px-2'} py-2.5 rounded-lg text-sm transition-all text-left
+                        ${isActive
+                          ? 'bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white font-medium'
+                          : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'
+                        }`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <Icon className="w-5 h-5 flex-shrink-0" />
+                        {isOpen && <span className="truncate">{item.label}</span>}
+                      </div>
+                      {isOpen && (
+                        <svg
+                          className={`w-4 h-4 transition-transform ${isSubMenuOpen ? 'rotate-90' : ''}`}
+                          fill="none"
+                          stroke="currentColor"
+                          viewBox="0 0 24 24"
+                        >
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                        </svg>
+                      )}
+                    </button>
+                  ) : (
+                    <Link
+                      href={(item as { href: string }).href}
+                      title={item.label}
+                      className={`flex items-center ${isOpen ? 'gap-3 px-3' : 'justify-center px-2'} py-2.5 rounded-lg text-sm transition-all
+                        ${isActive
+                          ? 'bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white font-medium'
+                          : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'
+                        }`}
+                    >
+                      <Icon className="w-5 h-5 flex-shrink-0" />
+                      {isOpen && <span className="truncate">{item.label}</span>}
+                    </Link>
+                  )}
+
+                  {/* Submenu */}
+                  {hasSubMenu && isOpen && isSubMenuOpen && (
+                    <ul className="mt-2 ml-8 space-y-1">
+                      {item.subMenu.map((sub) => (
+                        <li key={sub.href}>
+                          <Link
+                            href={sub.href}
+                            className={`block px-4 py-2 text-sm rounded-lg transition-all
+                              ${pathname === sub.href
+                                ? 'text-blue-600 dark:text-blue-400 font-medium bg-blue-50 dark:bg-blue-900/20'
+                                : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700'
+                              }`}
+                          >
+                            {sub.label}
+                          </Link>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </nav>
+      </aside>
+    </>
+  );
+}

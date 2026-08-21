@@ -1,0 +1,156 @@
+import axiosInstance from '@/lib/axios';
+import { EcommerceTheme } from '@/lib/ecommerceDesignSystem';
+
+export interface ShowcaseCategory {
+  category_id: number;
+  subcategories: number[];
+}
+
+export interface HomepagePromotionBannerItem {
+  promotion_id: number;
+  timer_enabled: boolean;
+  image?: string;
+  override_image?: { url: string; path?: string } | null;
+  promotion?: {
+    id: number;
+    code?: string;
+    name: string;
+    description?: string | null;
+    type?: string;
+    discount_value?: number | string;
+    start_date?: string | null;
+    end_date?: string | null;
+    is_active?: boolean;
+    is_public?: boolean;
+  };
+  new_image_file?: File | null;
+  new_image_preview?: string | null;
+}
+
+export interface DeliveryChargeSettings {
+  inside_dhaka: number;
+  outside_dhaka: number;
+}
+
+export interface HomepageSettings {
+  global_theme?: EcommerceTheme;
+  ticker: {
+    enabled: boolean;
+    mode: 'static' | 'moving';
+    phrases: string[];
+    background_color?: string;
+    text_color?: string;
+    speed?: number;
+  };
+  hero: {
+    images: { url: string; path?: string }[];
+    title: string;
+    show_title: boolean;
+    slideshow_enabled?: boolean;
+    autoplay_speed?: number;
+    text_position?: string;
+    text_color?: string;
+    font_size?: number;
+    transition_type?: 'fade' | 'slide';
+  };
+  collections: {
+    id: number;
+    type?: 'category' | 'collection';
+    title?: string;
+    subtitle: string;
+    image?: string;
+    href?: string;
+    show_text?: boolean;
+  }[];
+  showcase?: ShowcaseCategory[];
+  new_arrivals?: {
+    enabled: boolean;
+    product_ids: number[];
+    products?: any[]; // For storefront display
+  };
+  bannered_collections?: {
+    id: number;
+    type: 'category' | 'collection';
+    title?: string;
+    subtitle?: string;
+    show_text?: boolean;
+    image?: string; // Resolved URL
+    override_image?: { url: string; path?: string };
+    href?: string;
+  }[];
+  promotion_banners?: {
+    enabled: boolean;
+    items: HomepagePromotionBannerItem[];
+  };
+  section_order?: string[];
+}
+
+class SettingsService {
+  /**
+   * Get e-commerce delivery charge settings for public checkout.
+   */
+  async getDeliveryChargeSettings(): Promise<DeliveryChargeSettings> {
+    const response = await axiosInstance.get('/catalog/delivery-charges');
+    return response.data?.data ?? response.data;
+  }
+
+  /**
+   * Get e-commerce delivery charge settings for admin panel.
+   */
+  async getAdminDeliveryChargeSettings(): Promise<DeliveryChargeSettings> {
+    const response = await axiosInstance.get('/settings/delivery-charge');
+    return response.data?.data ?? response.data;
+  }
+
+  /**
+   * Update delivery charge settings (admin).
+   */
+  async updateDeliveryChargeSettings(data: DeliveryChargeSettings): Promise<{ message: string; data: DeliveryChargeSettings }> {
+    const response = await axiosInstance.post('/settings/delivery-charge', data);
+    return response.data;
+  }
+
+  /**
+   * Get homepage settings for public display
+   */
+  async getHomepageSettings(group?: 'hero' | 'collections' | 'new_arrivals' | 'showcase' | 'bannered_collections' | 'promotion_banners' | 'global_theme'): Promise<Partial<HomepageSettings>> {
+    const response = await axiosInstance.get('/catalog/homepage-settings', {
+      params: group ? { group } : {}
+    });
+    return response.data;
+  }
+
+
+  /**
+   * Get storefront design-system tokens for e-commerce pages.
+   */
+  async getGlobalTheme(): Promise<EcommerceTheme> {
+    const response = await axiosInstance.get('/catalog/homepage-settings', {
+      params: { group: 'global_theme' }
+    });
+    return response.data.global_theme;
+  }
+
+  /**
+   * Get homepage settings for admin panel
+   */
+  async getAdminHomepageSettings(): Promise<HomepageSettings> {
+    const response = await axiosInstance.get('/settings/homepage');
+    return response.data;
+  }
+
+  /**
+   * Update homepage settings (admin)
+   */
+  async updateHomepageSettings(data: FormData): Promise<{ message: string }> {
+    const response = await axiosInstance.post('/settings/homepage', data, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
+    return response.data;
+  }
+}
+
+const settingsService = new SettingsService();
+export default settingsService;

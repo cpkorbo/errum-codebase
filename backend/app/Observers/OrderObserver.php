@@ -1,0 +1,163 @@
+<?php
+
+namespace App\Observers;
+
+use App\Models\Order;
+use App\Services\SalesTargetAggregationService;
+use App\Services\AccountingPostingService;
+use App\Services\PaymentCommissionService;
+use Illuminate\Support\Facades\Log;
+
+class OrderObserver
+{
+    protected $aggregationService;
+
+    public function __construct(SalesTargetAggregationService $aggregationService)
+    {
+        $this->aggregationService = $aggregationService;
+    }
+
+    public function created(Order $order): void
+    {
+        $this->aggregationService->syncOrderChange($order);
+    }
+
+    public function updated(Order $order): void
+    {
+        if ($order->wasChanged(['status', 'created_by', 'salesman_id', 'store_id', 'total_amount', 'order_date'])) {
+            $this->aggregationService->syncOrderChange($order, $order->getOriginal());
+        }
+
+        if ($order->wasChanged(['order_date', 'store_id'])) {
+            try {
+                app(PaymentCommissionService::class)->syncOrder($order, true);
+            } catch (\Throwable $e) {
+                Log::error('Order date/store commission rebalance failed', [
+                    'order_id' => $order->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        if ($order->wasChanged('status')) {
+            try {
+                if (in_array(strtolower((string) $order->status), ['cancelled', 'canceled', 'void', 'deleted'], true)) {
+                    app(PaymentCommissionService::class)->cancelOrder($order, 'Order status changed to ' . $order->status . '.');
+                } else {
+                    app(PaymentCommissionService::class)->syncOrder($order, false);
+                }
+            } catch (\Throwable $e) {
+                Log::error('Order status commission rebalance failed', [
+                    'order_id' => $order->id,
+                    'status' => $order->status,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        if ($order->wasChanged('status')) {
+            if (in_array($order->status, ['delivered', 'completed'], true)) {
+                try {
+                    app(\App\Services\LoyaltyCardService::class)->awardForOrder($order->fresh(['payments']) ?: $order);
+                } catch (\Throwable $e) {
+                    Log::error('Order loyalty awarding failed', [
+                        'order_id' => $order->id,
+                        'order_number' => $order->order_number,
+                        'status' => $order->status,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+
+            if (in_array($order->status, ['cancelled', 'refunded'], true)) {
+                try {
+                    app(\App\Services\LoyaltyCardService::class)->reverseAllEarnedForOrder(
+                        $order,
+                        (string) $order->status,
+                        auth()->id()
+                    );
+                } catch (\Throwable $e) {
+                    Log::error('Order loyalty reversal failed', [
+                        'order_id' => $order->id,
+                        'order_number' => $order->order_number,
+                        'status' => $order->status,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+
+            try {
+                $posting = app(AccountingPostingService::class);
+
+                if (in_array($order->status, ['delivered', 'completed'], true)) {
+                    // For online/social commerce: clear Customer Advance into Sales Revenue when the sale is final.
+                    // For all order types: create COGS/Inventory entry if it has not already been posted.
+                    $posting->postOrderCompletionRevenue($order->fresh(['payments', 'items']) ?: $order);
+                    $posting->postOrderCOGS($order->fresh(['items']) ?: $order);
+                }
+
+                if (in_array($order->status, ['cancelled', 'refunded'], true)) {
+                    // Do not delete historical rows; mark pending/completed ledger for this order source as cancelled.
+                    // Actual refunds/returns are posted by Refund/ProductReturn observers.
+                    \App\Models\Transaction::where('reference_type', Order::class)
+                        ->where('reference_id', $order->id)
+                        ->whereIn('status', ['pending', 'completed'])
+                        ->where(function ($q) {
+                            $q->where('metadata->source', 'order_cogs')
+                              ->orWhere('metadata->source', 'order_completion_revenue');
+                        })
+                        ->update(['status' => 'cancelled']);
+                }
+            } catch (\Throwable $e) {
+                Log::error('Order accounting observer failed', [
+                    'order_id' => $order->id,
+                    'order_number' => $order->order_number,
+                    'status' => $order->status,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+    }
+
+    public function deleting(Order $order): void
+    {
+        try {
+            app(PaymentCommissionService::class)->cancelOrder($order, 'Order deleted.');
+        } catch (\Throwable $e) {
+            Log::error('Deleted order commission cancellation failed', [
+                'order_id' => $order->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        try {
+            app(\App\Services\LoyaltyCardService::class)->reverseAllEarnedForOrder(
+                $order,
+                'deleted',
+                auth()->id()
+            );
+        } catch (\Throwable $e) {
+            Log::error('Deleted order loyalty reversal failed', [
+                'order_id' => $order->id,
+                'order_number' => $order->order_number,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    public function deleted(Order $order): void
+    {
+        $this->aggregationService->syncOrderChange($order, $order->toArray());
+    }
+
+    public function restored(Order $order): void
+    {
+        $this->aggregationService->syncOrderChange($order);
+        app(PaymentCommissionService::class)->syncOrder($order, false);
+    }
+
+    public function forceDeleted(Order $order): void
+    {
+        $this->aggregationService->syncOrderChange($order, $order->toArray());
+    }
+}

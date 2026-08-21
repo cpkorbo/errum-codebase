@@ -1,0 +1,1685 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Product;
+use App\Models\Category;
+use App\Models\ProductBarcode;
+use App\Models\ReservedProduct;
+use App\Traits\DatabaseAgnosticSearch;
+use Illuminate\Http\Request;
+use App\Traits\ProductImageFallback;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+
+class EcommerceCatalogController extends Controller
+{
+    use ProductImageFallback;
+    use DatabaseAgnosticSearch;
+    /**
+     * Get products for e-commerce (public endpoint)
+     *
+     * Supports: category (slug or id), price range, search (name/sku/category/color/size),
+     * stock filter, sort (price_asc|price_desc|newest|name), pagination, SKU grouping.
+     *
+     * Architecture — two-step approach to avoid MySQL ONLY_FULL_GROUP_BY errors:
+     *   Step 1: buildFilterQuery() — raw DB::table query, explicit columns only (no SELECT *),
+     *           every non-aggregate column in SELECT is also in GROUP BY.
+     *   Step 2: Eloquent with(['images','category','batches']) on the resolved IDs/base_names.
+     */
+    public function getProducts(Request $request)
+    {
+        try {
+            $perPage    = max(1, min((int) $request->get('per_page', 30), 200));
+            $isGrouped  = $request->boolean('group_by_sku', true);
+            $categorySlug = $request->get('category_slug') ?? $request->get('slug');
+            $categoryId   = $request->get('category_id');
+            $minPrice   = $request->get('min_price');
+            $maxPrice   = $request->get('max_price');
+            $sortBy     = $request->get('sort_by', 'created_at');
+            $sortOrder  = $request->get('sort_order', 'desc');
+            $search     = $request->get('search') ?? $request->get('q');
+            $inStock    = $request->get('in_stock', 'true');
+
+            // Resolve category IDs (self + descendants)
+            $categoryIds = null;
+            if ($categorySlug || $categoryId) {
+                $catModel = $categoryId
+                    ? Category::find((int) $categoryId)
+                    : Category::where('slug', $categorySlug)->first();
+
+                if (!$catModel) {
+                    return $this->emptyResponse($request, $perPage, $categorySlug, $categoryId, $minPrice, $maxPrice, $search, $sortBy, $isGrouped);
+                }
+                $categoryIds = $this->collectCategoryAndDescendantIds($catModel);
+            }
+
+            return $isGrouped
+                ? $this->getGroupedProducts($request, $perPage, $categoryIds, $minPrice, $maxPrice, $sortBy, $search, $inStock, $categorySlug, $categoryId)
+                : $this->getFlatProducts($request, $perPage, $categoryIds, $minPrice, $maxPrice, $sortBy, $sortOrder, $search, $inStock, $categorySlug, $categoryId);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Error fetching products: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Step 1: Build per-product filter query (one row per products.id).
+     *
+     * KEY DESIGN — safe under MySQL ONLY_FULL_GROUP_BY:
+     *  - Never SELECT * from a joined table.
+     *  - Every non-aggregate column in SELECT is listed in GROUP BY.
+     *  - Price/stock filters use HAVING (they depend on aggregates).
+     *  - Text search uses correlated WHERE EXISTS sub-selects to avoid
+     *    joining more tables that would force more GROUP BY columns.
+     *
+     * Returned columns: id, base_name, category_id, created_at,
+     *                   min_batch_price, total_qty
+     */
+        private function buildFilterQuery(
+        ?array  $categoryIds,
+        ?string $minPrice,
+        ?string $maxPrice,
+        string  $sortBy,
+        ?string $search,
+        string  $inStock
+    ) {
+        $q = DB::table('products')
+            ->leftJoin('product_batches', function ($join) {
+                $join->on('products.id', '=', 'product_batches.product_id')
+                     ->where('product_batches.is_active', true)
+                     ->where('product_batches.availability', true);
+            })
+            ->leftJoin('reserved_products', 'reserved_products.product_id', '=', 'products.id')
+            ->whereNull('products.deleted_at')
+            ->where('products.is_archived', false)
+            ->select([
+                'products.id',
+                'products.name',
+                'products.base_name',
+                'products.sku',
+                'products.created_at',
+                DB::raw('MIN(product_batches.sell_price) AS min_batch_price'),
+                DB::raw('MAX(reserved_products.available_inventory) AS reserved_available_inventory'),
+                // We keep category_id in select/groupby because it's often needed for further filtering/grouping
+                'products.category_id', 
+            ])
+            ->groupBy('products.id', 'products.name', 'products.base_name', 'products.sku', 'products.created_at', 'products.category_id');
+
+        if ($categoryIds !== null) {
+            $q->whereIn('products.category_id', $categoryIds);
+        }
+
+        if ($search) {
+            $normalized = $this->normalizeString($search);
+
+            // Size-only searches such as "L", "M", "XL" or "40" must be exact
+            // variation/size filters. A broad LIKE search makes "L" match unrelated
+            // product names, colours, categories, XL, 40/42 groups, etc.
+            if ($this->shouldTreatAsStrictSizeSearch($search)) {
+                $sizeToken = $this->normalizeSizeToken($search);
+                $q->where(function ($sizeQ) use ($sizeToken) {
+                    $this->whereExactSizeToken($sizeQ, 'products.variation_suffix', $sizeToken);
+                    $sizeQ->orWhereExists(function ($sub) use ($sizeToken) {
+                        $sub->select(DB::raw(1))
+                            ->from('product_fields')
+                            ->join('fields', 'fields.id', '=', 'product_fields.field_id')
+                            ->whereColumn('product_fields.product_id', 'products.id')
+                            ->whereIn('fields.title', ['Size', 'size']);
+                        $this->whereExactSizeToken($sub, 'product_fields.value', $sizeToken);
+                    });
+                });
+            } else {
+                $terms = explode(' ', $normalized);
+                $brandStopWords = [
+                    'the', 'a', 'an', 'by', 'x', 'de', 'la', 'le', 'and', 'with', 'for', 'of', 'in', 'low', 'high', 'mid', '1'
+                ];
+                // Filter out stop words unless all are stop words
+                $nonStopTerms = array_filter($terms, function ($term) use ($brandStopWords) {
+                    return !in_array($term, $brandStopWords);
+                });
+                $termsToUse = !empty($nonStopTerms) ? $nonStopTerms : $terms;
+
+                $rawSearch = trim($search);
+                $compactSearch = preg_replace('/[\s\-\/_]+/', '', $rawSearch);
+
+                $q->where(function ($sq) use ($termsToUse, $rawSearch, $compactSearch) {
+                    if ($rawSearch !== '') {
+                        $sq->orWhere('products.sku', 'like', '%' . addslashes($rawSearch) . '%');
+                    }
+
+                    if ($compactSearch !== '') {
+                        $sq->orWhereRaw("REPLACE(REPLACE(REPLACE(REPLACE(products.sku, ' ', ''), '-', ''), '/', ''), '_', '') LIKE ?", ['%' . $compactSearch . '%']);
+                    }
+
+                    foreach ($termsToUse as $term) {
+                        $term = trim($term);
+                        if (empty($term)) continue;
+                        $like = '%' . addslashes($term) . '%';
+                        
+                        $sq->orWhere(function ($wordQ) use ($like) {
+                            $wordQ->where('products.name',              'like', $like)
+                               ->orWhere('products.base_name',       'like', $like)
+                               ->orWhere('products.sku',             'like', $like)
+                               ->orWhere('products.variation_suffix','like', $like)
+                               ->orWhereExists(function ($sub) use ($like) {
+                                   $sub->select(DB::raw(1))
+                                       ->from('categories')
+                                       ->whereColumn('categories.id', 'products.category_id')
+                                       ->where('categories.title', 'like', $like);
+                               })
+                               ->orWhereExists(function ($sub) use ($like) {
+                                   $sub->select(DB::raw(1))
+                                       ->from('product_fields')
+                                       ->join('fields', 'fields.id', '=', 'product_fields.field_id')
+                                       ->whereColumn('product_fields.product_id', 'products.id')
+                                       ->where('product_fields.value', 'like', $like)
+                                       ->whereIn('fields.title', ['Color', 'Size', 'Colour']);
+                               });
+                        });
+                    }
+                });
+            }
+        }
+
+        // Apply price and stock filters first (in HAVING)
+        if ($inStock === 'true' || $inStock === true) {
+            $q->havingRaw('GREATEST(COALESCE(MAX(reserved_products.available_inventory), 0), COALESCE(SUM(product_batches.quantity), 0)) > 0');
+        } elseif ($inStock === 'false' || $inStock === false) {
+            $q->havingRaw('GREATEST(COALESCE(MAX(reserved_products.available_inventory), 0), COALESCE(SUM(product_batches.quantity), 0)) = 0');
+        }
+
+        if ($minPrice !== null && $minPrice !== '') {
+            $q->havingRaw('MIN(product_batches.sell_price) >= ?', [(float) $minPrice]);
+        }
+        if ($maxPrice !== null && $maxPrice !== '') {
+            $q->havingRaw('MIN(product_batches.sell_price) <= ?', [(float) $maxPrice]);
+        }
+
+        return $q;
+    }
+
+    /**
+     * Grouped listing: groups by base_name ("mother products"), paginates groups,
+     * then fetches full Eloquent data for the page's base_names.
+     *
+     * The outer GROUP BY base_name subquery is ONLY_FULL_GROUP_BY-safe because it
+     * selects only base_name plus aggregates — no raw product columns leak through.
+     */
+        private function getGroupedProducts(
+        Request $request,
+        int     $perPage,
+        ?array  $categoryIds,
+        ?string $minPrice,
+        ?string $maxPrice,
+        string  $sortBy,
+        ?string $search,
+        string  $inStock,
+        ?string $categorySlug,
+        $categoryId
+    ) {
+        $page  = max(1, (int) $request->get('page', 1));
+
+        // Step 1: Build the inner query that applies all filters and joins.
+        $baseQ = $this->buildFilterQuery($categoryIds, $minPrice, $maxPrice, $sortBy, $search, $inStock);
+
+        // Subquery wrap: group by base_name. NO select * here.
+        $groupQ = DB::table(DB::raw("({$baseQ->toSql()}) AS pq"))
+            ->mergeBindings($baseQ)
+            ->select([
+                'base_name',
+                DB::raw('MAX(name)            AS name'),
+                DB::raw('MAX(sku)             AS sku'),
+                DB::raw('MIN(min_batch_price) AS group_min_price'),
+                DB::raw('MAX(created_at)      AS latest_created_at'),
+            ])
+            ->groupBy('base_name');
+
+        if ($search) {
+            $allGroups = $groupQ->get()->all();
+            
+            $rankedGroups = $this->scoreAndRankProducts($allGroups, $search);
+            
+            $totalGroups = count($rankedGroups);
+            
+            $offset = ($page - 1) * $perPage;
+            $pagedRanked = array_slice($rankedGroups, $offset, $perPage);
+            
+            $baseNames = collect($pagedRanked)->pluck('base_name')->filter()->values();
+        } else {
+            // Sorting groups
+            if ($sortBy === 'price_asc') {
+                $groupQ->orderBy('group_min_price', 'asc');
+            } elseif ($sortBy === 'price_desc') {
+                $groupQ->orderBy('group_min_price', 'desc');
+            } elseif ($sortBy === 'name') {
+                $groupQ->orderBy('base_name', 'asc');
+            } else {
+                $groupQ->orderBy('latest_created_at', 'desc');
+            }
+
+            // Count groups safely
+            $totalGroupsRaw = DB::select("select count(*) as aggregate from (" . $groupQ->toSql() . ") AS gq", $groupQ->getBindings());
+            $totalGroups = $totalGroupsRaw[0]->aggregate ?? 0;
+
+            // Paginate groups
+            $pagedGroups = $groupQ->offset(($page - 1) * $perPage)->limit($perPage)->get();
+            $baseNames   = $pagedGroups->pluck('base_name')->filter()->values();
+        }
+
+        if ($baseNames->isEmpty()) {
+            return $this->emptyResponse($request, $perPage, $categorySlug, $categoryId, $minPrice, $maxPrice, $search, $sortBy, true);
+        }
+
+        // Step 2: Load Eloquent models only for the filtered and paginated results.
+        $allVariantsQuery = Product::with(['images', 'category', 'batches', 'reservedProduct'])
+            ->whereIn('base_name', $baseNames)
+            ->where('is_archived', false)
+            ->whereNull('deleted_at');
+
+        // Do not pull same-named variants from unrelated categories after the
+        // category slug has already filtered the first-stage query.
+        if ($categoryIds !== null) {
+            $allVariantsQuery->whereIn('category_id', $categoryIds);
+        }
+
+        // When the sidebar search is a pure size filter, do not send unrelated
+        // variants back inside the matching product group. Example: searching "L"
+        // should not show M, XL, 40 or 42 variants under the same base product.
+        if ($search && $this->shouldTreatAsStrictSizeSearch($search)) {
+            $sizeToken = $this->normalizeSizeToken($search);
+            $allVariantsQuery->where(function ($variantQ) use ($sizeToken) {
+                $this->whereExactSizeToken($variantQ, 'variation_suffix', $sizeToken);
+                $variantQ->orWhereHas('productFields', function ($fieldQ) use ($sizeToken) {
+                    $fieldQ->whereHas('field', function ($fieldNameQ) {
+                        $fieldNameQ->whereIn('title', ['Size', 'size']);
+                    });
+                    $this->whereExactSizeToken($fieldQ, 'value', $sizeToken);
+                });
+            });
+        }
+
+        $allVariants = $allVariantsQuery->get();
+        $variantsByBaseName = $allVariants->groupBy('base_name');
+
+        $orderedResult = [];
+        foreach ($baseNames as $baseName) {
+            $group = $variantsByBaseName->get($baseName);
+            if (!$group || $group->isEmpty()) continue;
+
+            // Sort variants within group for deterministic main product
+            $mainProduct = $group->sortBy(function ($p) {
+                $price = $p->batches->where('is_active', true)->where('availability', true)->where('quantity', '>', 0)->min('sell_price');
+                return $price ?? PHP_INT_MAX;
+            })->first() ?? $group->first();
+
+            $groupPrices = $group
+                ->flatMap(fn($p) => $p->batches
+                    ->where('is_active', true)
+                    ->where('availability', true)
+                    ->pluck('sell_price'))
+                ->map(fn($price) => (float) $price)
+                ->filter(fn($price) => $price > 0)
+                ->values();
+
+            $groupMin = $groupPrices->isNotEmpty() ? (float) $groupPrices->min() : 0.0;
+            $groupMax = $groupPrices->isNotEmpty() ? (float) $groupPrices->max() : $groupMin;
+
+            $formattedVariants = $group->values()->map(fn($p) => $this->formatProductForApi($p))->all();
+            $formattedMain     = $this->formatProductForApi($mainProduct, $groupMin);
+
+            $totalAvailable  = array_sum(array_column($formattedVariants, 'available_inventory'));
+            $totalReserved   = array_sum(array_column($formattedVariants, 'reserved_inventory'));
+            $totalStock      = array_sum(array_column($formattedVariants, 'stock_quantity'));
+            $inStockVariants = count(array_filter($formattedVariants, fn($variant) => ($variant['available_inventory'] ?? 0) > 0));
+
+            $orderedResult[] = [
+                'id'               => $mainProduct->id,
+                'name'             => $mainProduct->name,
+                'base_name'        => $mainProduct->base_name,
+                'variation_suffix' => $mainProduct->variation_suffix,
+                'sku'              => $mainProduct->sku,
+                'description'      => $mainProduct->description,
+                'category'         => $mainProduct->category,
+                'images'           => $mainProduct->images,
+                'variants_count'   => $group->count(),
+                'min_price'        => $groupMin,
+                'max_price'        => $groupMax,
+                'total_available'   => $totalAvailable,
+                'total_reserved'    => $totalReserved,
+                'total_stock'       => $totalStock,
+                'in_stock_variants' => $inStockVariants,
+                'variants'          => $formattedVariants,
+                'main_variant'     => $formattedMain,
+            ];
+        }
+
+        $lastPage = max(1, (int) ceil($totalGroups / $perPage));
+
+        return response()->json([
+            'success' => true,
+            'data'    => [
+                'grouped_products' => $orderedResult,
+                'products'         => array_column($orderedResult, 'main_variant'),
+                'pagination'       => [
+                    'current_page'   => $page,
+                    'last_page'      => $lastPage,
+                    'per_page'       => $perPage,
+                    'total'          => $totalGroups,
+                    'has_more_pages' => $page < $lastPage,
+                ],
+                'filters_applied' => [
+                    'category_slug' => $categorySlug,
+                    'category_id'   => $categoryId,
+                    'min_price'     => $minPrice,
+                    'max_price'     => $maxPrice,
+                    'search'        => $search,
+                    'in_stock'      => $inStock,
+                    'sort_by'       => $sortBy,
+                ],
+            ],
+        ]);
+    }
+
+    /**
+     * Flat (non-grouped) product listing.
+     */
+        private function getFlatProducts(
+        Request $request,
+        int     $perPage,
+        ?array  $categoryIds,
+        ?string $minPrice,
+        ?string $maxPrice,
+        string  $sortBy,
+        string  $sortOrder,
+        ?string $search,
+        string  $inStock,
+        ?string $categorySlug,
+        $categoryId
+    ) {
+        $page  = max(1, (int) $request->get('page', 1));
+        $baseQ = $this->buildFilterQuery($categoryIds, $minPrice, $maxPrice, $sortBy, $search, $inStock);
+
+        if ($search) {
+            $allCandidates = $baseQ->get()->all();
+            
+            $ranked = $this->scoreAndRankProducts($allCandidates, $search);
+            
+            $total = count($ranked);
+            
+            $offset = ($page - 1) * $perPage;
+            $pagedRanked = array_slice($ranked, $offset, $perPage);
+            
+            $productIds = collect($pagedRanked)->pluck('id');
+        } else {
+            if ($sortBy === 'price_asc') {
+                $baseQ->orderBy('min_batch_price', 'asc');
+            } elseif ($sortBy === 'price_desc') {
+                $baseQ->orderBy('min_batch_price', 'desc');
+            } elseif ($sortBy === 'name') {
+                $baseQ->orderBy('products.name', $sortOrder === 'asc' ? 'asc' : 'desc');
+            } else {
+                $baseQ->orderBy('products.created_at', 'desc');
+            }
+
+            // Count safely
+            $totalRaw = DB::select("select count(*) as aggregate from (" . $baseQ->toSql() . ") AS pq", $baseQ->getBindings());
+            $total    = $totalRaw[0]->aggregate ?? 0;
+
+            $rows       = $baseQ->offset(($page - 1) * $perPage)->limit($perPage)->get();
+            $productIds = $rows->pluck('id');
+        }
+
+        $products = Product::with(['images', 'category', 'batches', 'reservedProduct'])
+            ->whereIn('id', $productIds)
+            ->whereNull('deleted_at')
+            ->get()
+            ->sortBy(fn($p) => $productIds->search($p->id))
+            ->values()
+            ->map(fn($p) => $this->formatProductForApi($p));
+
+        $lastPage = max(1, (int) ceil($total / $perPage));
+
+        return response()->json([
+            'success' => true,
+            'data'    => [
+                'products'   => $products,
+                'pagination' => [
+                    'current_page'   => $page,
+                    'last_page'      => $lastPage,
+                    'per_page'       => $perPage,
+                    'total'          => $total,
+                    'has_more_pages' => $page < $lastPage,
+                ],
+                'filters_applied' => [
+                    'category_slug' => $categorySlug,
+                    'category_id'   => $categoryId,
+                    'min_price'     => $minPrice,
+                    'max_price'     => $maxPrice,
+                    'search'        => $search,
+                    'in_stock'      => $inStock,
+                    'sort_by'       => $sortBy,
+                ],
+            ],
+        ]);
+    }
+
+
+    /**
+     * Format a single Eloquent Product model into a frontend-compatible array.
+     * Crucially adds `selling_price` and `stock_quantity` derived from batches,
+     * since the products table has no selling_price column — prices live in product_batches.
+     */
+    private function formatProductForApi(Product $product, ?float $groupMinPrice = null): array
+    {
+        $activeBatches = $product->batches->where('is_active', true)->where('availability', true);
+
+        // Selling price = lowest price from in-stock batches; fallback to any active batch
+        $inStockBatches = $activeBatches->where('quantity', '>', 0)->sortBy('sell_price');
+        $cheapestBatch  = $inStockBatches->first() ?? $activeBatches->sortBy('sell_price')->first();
+
+        $sellingPrice  = $cheapestBatch ? (float) $cheapestBatch->sell_price : ($groupMinPrice ?? 0);
+        $totalStock    = (int) $activeBatches->sum('quantity');
+
+        // available_inventory = total - reserved (from reserved_products table)
+        $reservedRow = $product->relationLoaded('reservedProduct')
+            ? $product->reservedProduct
+            : \App\Models\ReservedProduct::where('product_id', $product->id)->first();
+        $reservedInventory  = $reservedRow ? (int) $reservedRow->reserved_inventory : 0;
+        $availableInventory = $reservedRow ? (int) $reservedRow->available_inventory : $totalStock;
+
+        return [
+            'id'                  => $product->id,
+            'name'                => $product->name,
+            'base_name'           => $product->base_name,
+            'variation_suffix'    => $product->variation_suffix,
+            'sku'                 => $product->sku,
+            'description'         => $product->description,
+            'selling_price'       => $sellingPrice,   // REQUIRED by frontend normalizeProduct()
+            'price'               => $sellingPrice,   // alias
+            'stock_quantity'      => $totalStock,
+            'total_stock'         => $totalStock,
+            'available_inventory' => $availableInventory,
+            'reserved_inventory'  => $reservedInventory,
+            'in_stock'            => $availableInventory > 0,
+            'category'            => $product->category,
+            'images'              => $product->images,
+            'batches'             => $product->batches,
+        ];
+    }
+
+    private function shouldHideCostPrice(Request $request): bool
+    {
+        if ($request->boolean('hide_cost_price')) {
+            return true;
+        }
+
+        if ($request->has('include_availability') && !$request->boolean('include_availability')) {
+            return true;
+        }
+
+        $refererPath = parse_url($request->headers->get('referer', ''), PHP_URL_PATH);
+
+        return is_string($refererPath) && str_contains($refererPath, '/e-commerce/');
+    }
+
+    private function removeCostPriceFields($value)
+    {
+        if ($value instanceof \Illuminate\Support\Collection) {
+            return $value->map(function ($item) {
+                return $this->removeCostPriceFields($item);
+            });
+        }
+
+        if (!is_array($value)) {
+            return $value;
+        }
+
+        unset($value['cost_price']);
+
+        foreach ($value as $key => $item) {
+            $value[$key] = $this->removeCostPriceFields($item);
+        }
+
+        return $value;
+    }
+
+    /**
+     * Consistent empty response (no products / category not found).
+     */
+    private function emptyResponse($request, $perPage, $slug, $id, $min, $max, $search, $sort, bool $grouped = false)
+    {
+        $data = [
+            'products'   => [],
+            'pagination' => [
+                'current_page'   => (int) $request->get('page', 1),
+                'last_page'      => 1,
+                'per_page'       => $perPage,
+                'total'          => 0,
+                'has_more_pages' => false,
+            ],
+            'filters_applied' => [
+                'category_slug' => $slug,
+                'category_id'   => $id,
+                'min_price'     => $min,
+                'max_price'     => $max,
+                'search'        => $search,
+                'sort_by'       => $sort,
+            ],
+        ];
+        if ($grouped) {
+            $data['grouped_products'] = [];
+        }
+        return response()->json(['success' => true, 'data' => $data]);
+    }
+
+    /**
+     * Get single product details (public endpoint)
+     */
+    public function getProduct(Request $request, $identifier)
+    {
+        try {
+            // Find product by ID
+            $product = Product::with(['images', 'category', 'barcodes', 'batches' => function ($q) {
+                    $q->orderBy('sell_price', 'asc');
+                }])
+                ->where('is_archived', false)
+                ->where('id', $identifier)
+                ->firstOrFail();
+
+            // Related Essentials logic:
+            // 1. Get up to 20 random products from the same category (one per SKU group)
+            $relatedProductIds = DB::table('products')
+                ->where('category_id', $product->category_id)
+                ->where('base_name', '!=', $product->base_name)
+                ->where('is_archived', false)
+                ->whereNull('deleted_at')
+                ->whereExists(function ($query) {
+                    $query->select(DB::raw(1))
+                        ->from('product_batches')
+                        ->whereColumn('product_batches.product_id', 'products.id')
+                        ->where('product_batches.quantity', '>', 0)
+                        ->where('product_batches.is_active', true)
+                        ->where('product_batches.availability', true);
+                })
+                ->select(DB::raw('MIN(id) as id'))
+                ->groupBy('base_name')
+                ->inRandomOrder()
+                ->take(20)
+                ->pluck('id');
+
+            // 2. If we have fewer than 20, fill the rest with latest products from OTHER categories
+            if ($relatedProductIds->count() < 20) {
+                $fillCount = 20 - $relatedProductIds->count();
+                $fillIds = DB::table('products')
+                    ->where('category_id', '!=', $product->category_id) // "no duplicates from this category"
+                    ->where('is_archived', false)
+                    ->whereNull('deleted_at')
+                    ->whereExists(function ($query) {
+                        $query->select(DB::raw(1))
+                            ->from('product_batches')
+                            ->whereColumn('product_batches.product_id', 'products.id')
+                            ->where('product_batches.quantity', '>', 0)
+                            ->where('product_batches.is_active', true)
+                            ->where('product_batches.availability', true);
+                    })
+                    ->select(DB::raw('MIN(id) as id'))
+                    ->groupBy('base_name')
+                    ->orderBy(DB::raw('MAX(created_at)'), 'desc') // Latest products
+                    ->take($fillCount)
+                    ->pluck('id');
+                
+                $relatedProductIds = $relatedProductIds->concat($fillIds);
+            }
+
+            $relatedProducts = Product::with(['images', 'batches' => function ($q) {
+                    $q->orderBy('sell_price', 'asc');
+                }])
+                ->whereIn('id', $relatedProductIds)
+                ->get();
+
+            // Get variants (same base_name, different variation_suffix)
+            $variants = collect();
+            if ($product->base_name) {
+                $variants = Product::with(['images', 'batches' => function ($q) {
+                        $q->orderBy('sell_price', 'asc');
+                    }])
+                    ->where('base_name', $product->base_name)
+                    ->where('id', '!=', $product->id)
+                    ->where('is_archived', false)
+                    ->get()
+                    ->map(function ($variant) {
+                        $variantStock = $variant->batches->sum('quantity');
+                        $variantAvailableBatches = $variant->batches->where('quantity', '>', 0);
+                        $variantLowestBatch = $variantAvailableBatches->sortBy('sell_price')->first();
+                        $variantReserved = \App\Models\ReservedProduct::where('product_id', $variant->id)->first();
+                        $variantAvailableInventory = $variantReserved
+                            ? (int) $variantReserved->available_inventory
+                            : $variantStock;
+
+                        return [
+                            'id' => $variant->id,
+                            'name' => $variant->name,
+                            'variation_suffix' => $variant->variation_suffix,
+                            'sku' => $variant->sku,
+                            'selling_price' => $variantLowestBatch ? $variantLowestBatch->sell_price : null,
+                            'cost_price' => $variantLowestBatch ? $variantLowestBatch->cost_price : null,
+                            'stock_quantity' => $variantStock,
+                            'available_inventory' => $variantAvailableInventory,
+                            'reserved_inventory' => $variantReserved ? (int) $variantReserved->reserved_inventory : 0,
+                            'in_stock' => $variantAvailableInventory > 0,
+                            'images' => $variant->images->where('is_active', true)->map(function ($image) {
+                                return [
+                                    'id' => $image->id,
+                                    'url' => $image->image_url,
+                                    'is_primary' => $image->is_primary,
+                                    'alt_text' => $image->alt_text,
+                                ];
+                            }),
+                        ];
+                    });
+            }
+
+            $lowestBatch = $product->batches->sortBy('sell_price')->first();
+            $totalStock = $product->batches->sum('quantity');
+            $mainReserved = \App\Models\ReservedProduct::where('product_id', $product->id)->first();
+            $availableInventory = $mainReserved
+                ? (int) $mainReserved->available_inventory
+                : $totalStock;
+
+            // ✅ Merge core SKU images + variant image (primary) so details page always has images.
+            $mergedImages = $this->mergedActiveImages($product, ['id','url','alt_text','is_primary','sort_order']);
+            
+            $response = [
+                'success' => true,
+                'data' => [
+                    'product' => [
+                        'id' => $product->id,
+                        'name' => $product->name,
+                        'base_name' => $product->base_name,
+                        'variation_suffix' => $product->variation_suffix,
+                        'brand' => $product->brand,
+                        'sku' => $product->sku,
+                        'description' => $product->description,
+                        'selling_price' => $lowestBatch ? $lowestBatch->sell_price : 0,
+                        'cost_price' => $lowestBatch ? $lowestBatch->cost_price : 0,
+                        'stock_quantity' => $totalStock,
+                        'available_inventory' => $availableInventory,
+                        'reserved_inventory' => $mainReserved ? (int) $mainReserved->reserved_inventory : 0,
+                        'in_stock' => $availableInventory > 0,
+                        'has_variants' => $variants->count() > 0,
+                        'variants_count' => $variants->count(),
+                        'variants' => $variants,
+                        // primary-first, merged across SKU group
+                        'images' => $mergedImages,
+                        'category' => $product->category ? [
+                            'id' => $product->category->id,
+                            'name' => $product->category->title,
+                        ] : null,
+                        'vendor' => $product->vendor ? [
+                            'id' => $product->vendor->id,
+                            'name' => $product->vendor->business_name,
+                        ] : null,
+                        'created_at' => $product->created_at,
+                        'updated_at' => $product->updated_at,
+                    ],
+                    'related_products' => $relatedProducts->map(function ($product) {
+                        $lowestBatch = $product->batches->sortBy('sell_price')->first();
+                        $totalStock = $product->batches->sum('quantity');
+                        
+                        return [
+                            'id' => $product->id,
+                            'name' => $product->name,
+                            'brand' => $product->brand,
+                            'sku' => $product->sku,
+                            'selling_price' => $lowestBatch ? $lowestBatch->sell_price : 0,
+                            'images' => $product->images->where('is_active', true)->take(1),
+                            'in_stock' => $totalStock > 0,
+                        ];
+                    }),
+                ],
+            ];
+
+            // Always provide batches, but conditionally hide store_id (for branch availability control)
+            $response['data']['product']['batches'] = $product->batches->map(function ($batch) use ($request) {
+                $batchData = $batch->toArray();
+                if (!$request->boolean('include_availability', true)) {
+                    unset($batchData['store_id']);
+                    unset($batchData['store']); // Also unset eager-loaded store relation if any
+                }
+                return $batchData;
+            });
+
+            if ($this->shouldHideCostPrice($request)) {
+                $response = $this->removeCostPriceFields($response);
+            }
+
+            return response()->json($response);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Product not found',
+            ], 404);
+        }
+    }
+
+    /**
+     * Get categories for e-commerce (public endpoint)
+     */
+    public function getCategories(Request $request)
+    {
+        try {
+            $cacheKey = 'ecommerce_categories_tree';
+            $categoriesTree = Cache::remember($cacheKey, 3600, function () {
+                $categories = Category::with(['children' => function($q) {
+                        $q->where('is_active', true)->orderBy('order', 'asc');
+                    }])
+                    ->where('is_active', true)
+                    ->whereNull('parent_id')
+                    ->orderBy('order', 'asc')
+                    ->get();
+
+                return $this->transformCategoriesTree($categories);
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'categories' => $categoriesTree,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to get categories: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Internal recursive helper to transform category tree
+     */
+    private function transformCategoriesTree($categories)
+    {
+        return $categories->map(function ($category) {
+            $data = [
+                'id' => $category->id,
+                'name' => $category->title,
+                'slug' => $category->slug,
+                'description' => $category->description,
+                'image_url' => $category->image_url,
+                'product_count' => $category->products()->count(),
+            ];
+
+            if ($category->children && $category->children->count() > 0) {
+                $data['children'] = $this->transformCategoriesTree($category->children);
+            } else {
+                $data['children'] = [];
+            }
+
+            return $data;
+        });
+    }
+
+    /**
+     * Get featured products (public endpoint)
+     * Note: Since products table doesn't have is_featured, returning newest products with stock
+     */
+    public function getFeaturedProducts(Request $request)
+    {
+        try {
+            $limit = min($request->get('limit', 8), 20);
+
+            $cacheKey = "featured_products_{$limit}";
+            $products = Cache::remember($cacheKey, 1800, function () use ($limit) {
+                return Product::with(['images', 'category', 'batches' => function ($q) {
+                        $q->orderBy('sell_price', 'asc');
+                    }])
+                    ->where('is_archived', false)
+                    ->whereHas('batches', function ($q) {
+                        $q->where('quantity', '>', 0);
+                    })
+                    ->orderBy('created_at', 'desc')
+                    ->take($limit)
+                    ->get();
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'featured_products' => $products->map(function ($product) {
+                        $lowestBatch = $product->batches->sortBy('sell_price')->first();
+                        $totalStock = $product->batches->sum('quantity');
+                        
+                        return [
+                            'id' => $product->id,
+                            'name' => $product->name,
+                            'sku' => $product->sku,
+                            'selling_price' => $lowestBatch ? $lowestBatch->sell_price : 0,
+                            'images' => $product->images->where('is_active', true)->take(2)->map(function ($image) {
+                                return [
+                                    'id' => $image->id,
+                                    'url' => $image->image_url,
+                                    'alt_text' => $image->alt_text,
+                                    'is_primary' => $image->is_primary,
+                                ];
+                            }),
+                            'category' => $product->category ? [
+                                'name' => $product->category->title,
+                            ] : null,
+                            'in_stock' => $totalStock > 0,
+                        ];
+                    }),
+                    'total_featured' => $products->count(),
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to get featured products: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Product search with suggestions (public endpoint)
+     */
+    public function searchProducts(Request $request)
+    {
+        try {
+            $searchQuery = $request->get('q');
+            $perPage = max(1, min((int) $request->get('per_page', 30), 200));
+
+            if (!$searchQuery || strlen($searchQuery) < 2) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Search query must be at least 2 characters',
+                ], 400);
+            }
+
+            $stockMode = strtolower((string) $request->get('in_stock', 'true'));
+            $includeUnavailable = $stockMode === 'all' || $request->boolean('include_out_of_stock');
+
+            $products = Product::with(['images', 'category', 'batches' => function ($q) {
+                    $q->where('is_active', true)
+                      ->where('availability', true)
+                      ->orderBy('sell_price', 'asc');
+                }])
+                ->where('is_archived', false)
+                ->whereNull('deleted_at')
+                ->when(!$includeUnavailable, function ($query) {
+                    $query->whereHas('batches', function ($batchQuery) {
+                        $batchQuery->where('is_active', true)
+                            ->where('availability', true)
+                            ->where('quantity', '>', 0);
+                    });
+                })
+                ->where(function ($query) use ($searchQuery) {
+                    $this->whereAnyLike($query, ['name', 'sku'], $searchQuery);
+                });
+
+            // Add relevance ordering
+            $this->searchWithRelevance($products, ['name', 'sku'], $searchQuery, 'name');
+            
+            $products = $products->paginate($perPage);
+
+            // Get search suggestions
+            $suggestions = Product::where('is_archived', false)
+                ->where(function ($query) use ($searchQuery) {
+                    $this->whereLike($query, 'name', $searchQuery, 'start');
+                })
+                ->pluck('name')
+                ->take(5);
+
+            $transformedProducts = collect($products->items())->map(function ($product) {
+                $lowestBatch = $product->batches->sortBy('sell_price')->first();
+                $totalStock = (int) $product->batches->sum('quantity');
+                $reservedRow = ReservedProduct::where('product_id', $product->id)->first();
+                $reservedInventory = $reservedRow ? max(0, (int) $reservedRow->reserved_inventory) : 0;
+                $availableInventory = $reservedRow
+                    ? max(0, (int) $reservedRow->available_inventory)
+                    : max(0, $totalStock - $reservedInventory);
+                
+                return [
+                    'id' => $product->id,
+                    'name' => $product->name,
+                    'base_name' => $product->base_name,
+                    'variation_suffix' => $product->variation_suffix,
+                    'brand' => $product->brand,
+                    'sku' => $product->sku,
+                    'selling_price' => $lowestBatch ? (float) $lowestBatch->sell_price : 0,
+                    'price' => $lowestBatch ? (float) $lowestBatch->sell_price : 0,
+                    'stock_quantity' => $totalStock,
+                    'available_inventory' => $availableInventory,
+                    'reserved_inventory' => $reservedInventory,
+                    'images' => $product->images->where('is_active', true)->take(1),
+                    'category' => $product->category->title ?? null,
+                    'in_stock' => $availableInventory > 0,
+                ];
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'products' => $transformedProducts,
+                    'suggestions' => $suggestions,
+                    'search_query' => $searchQuery,
+                    'pagination' => [
+                        'current_page' => $products->currentPage(),
+                        'last_page' => $products->lastPage(),
+                        'per_page' => $products->perPage(),
+                        'total' => $products->total(),
+                    ],
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Search failed: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Get price range for filtering (public endpoint)
+     */
+    public function getPriceRange()
+    {
+        try {
+            $cacheKey = 'product_price_range';
+            $priceRange = Cache::remember($cacheKey, 3600, function () {
+                $minPrice = \App\Models\ProductBatch::where('quantity', '>', 0)
+                    ->min('sell_price');
+
+                $maxPrice = \App\Models\ProductBatch::where('quantity', '>', 0)
+                    ->max('sell_price');
+
+                return [
+                    'min_price' => $minPrice ?? 0,
+                    'max_price' => $maxPrice ?? 0,
+                ];
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => $priceRange,
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to get price range: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Get new arrivals (public endpoint)
+     */
+    public function getNewArrivals(Request $request)
+    {
+        try {
+            $limit = min($request->get('limit', 12), 30);
+            $days = (int) $request->get('days', 30);
+
+            // Group by base_name to avoid showing multiple variants of the same product
+            $latestIds = DB::table('products')
+                ->whereNull('deleted_at')
+                ->where('is_archived', false)
+                ->where('created_at', '>=', now()->subDays($days))
+                ->whereExists(function ($query) {
+                    $query->select(DB::raw(1))
+                        ->from('product_batches')
+                        ->whereColumn('product_batches.product_id', 'products.id')
+                        ->where('product_batches.quantity', '>', 0)
+                        ->where('product_batches.is_active', true)
+                        ->where('product_batches.availability', true);
+                })
+                ->select(DB::raw('MAX(id) as id'))
+                ->groupBy('base_name')
+                ->orderBy(DB::raw('MAX(created_at)'), 'desc')
+                ->take($limit)
+                ->pluck('id');
+
+            if ($latestIds->isEmpty()) {
+                return response()->json([
+                    'success' => true,
+                    'data' => [
+                        'new_arrivals' => [],
+                        'total_new_arrivals' => 0,
+                        'days_range' => $days,
+                    ],
+                ]);
+            }
+
+            $products = Product::with(['images', 'category', 'batches' => function ($q) {
+                    $q->orderBy('sell_price', 'asc');
+                }])
+                ->whereIn('id', $latestIds)
+                ->get()
+                ->sortByDesc('created_at')
+                ->values();
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'new_arrivals' => $products->map(function ($product) {
+                        return $this->formatProductForApi($product);
+                    }),
+                    'total_new_arrivals' => $products->count(),
+                    'days_range' => $days,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to get new arrivals: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Get suggested products based on sales (public endpoint)
+     * Returns top 5 best-selling products
+     */
+    public function getSuggestedProducts(Request $request)
+    {
+        try {
+            $limit = min($request->get('limit', 5), 20);
+
+            $cacheKey = "suggested_products_{$limit}";
+            $products = Cache::remember($cacheKey, 1800, function () use ($limit) {
+                // Get top products by total quantity sold
+                $topProductIds = \DB::table('order_items')
+                    ->select('product_id', \DB::raw('SUM(quantity) as total_sold'))
+                    ->whereNotNull('product_id')
+                    ->groupBy('product_id')
+                    ->orderByDesc('total_sold')
+                    ->limit($limit)
+                    ->pluck('product_id');
+
+                if ($topProductIds->isEmpty()) {
+                    // Fallback to newest products if no sales data
+                    return Product::with(['images', 'category', 'batches' => function ($q) {
+                            $q->orderBy('sell_price', 'asc');
+                        }])
+                        ->where('is_archived', false)
+                        ->whereHas('batches', function ($q) {
+                            $q->where('quantity', '>', 0);
+                        })
+                        ->orderBy('created_at', 'desc')
+                        ->take($limit)
+                        ->get();
+                }
+
+                // Get products with their sales data preserved in order
+                return Product::with(['images', 'category', 'batches' => function ($q) {
+                        $q->orderBy('sell_price', 'asc');
+                    }])
+                    ->where('is_archived', false)
+                    ->whereHas('batches', function ($q) {
+                        $q->where('quantity', '>', 0);
+                    })
+                    ->whereIn('id', $topProductIds)
+                    ->get()
+                    ->sortBy(function ($product) use ($topProductIds) {
+                        return array_search($product->id, $topProductIds->toArray());
+                    })
+                    ->values();
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'suggested_products' => $products->map(function ($product) {
+                        $lowestBatch = $product->batches->sortBy('sell_price')->first();
+                        $totalStock = $product->batches->sum('quantity');
+                        
+                        return [
+                            'id' => $product->id,
+                            'name' => $product->name,
+                            'brand' => $product->brand,
+                            'sku' => $product->sku,
+                            'selling_price' => $lowestBatch ? $lowestBatch->sell_price : 0,
+                            'images' => $product->images->where('is_active', true)->take(2)->map(function ($image) {
+                                return [
+                                    'id' => $image->id,
+                                    'url' => $image->image_url,
+                                    'alt_text' => $image->alt_text,
+                                    'is_primary' => $image->is_primary,
+                                ];
+                            }),
+                            'category' => $product->category ? [
+                                'name' => $product->category->title,
+                            ] : null,
+                            'in_stock' => $totalStock > 0,
+                        ];
+                    }),
+                    'total_suggested' => $products->count(),
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to get suggested products: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+
+    /**
+     * Enhanced search for products across name, category, subcategories, color and size
+     */
+    private function applyEnhancedSearch($query, $search)
+    {
+        $query->where(function ($q) use ($search) {
+            // Name and SKU
+            $q->where('products.name', 'like', "%{$search}%")
+              ->orWhere('products.base_name', 'like', "%{$search}%")
+              ->orWhere('products.sku', 'like', "%{$search}%")
+              
+              // Category & Subcategories
+              ->orWhereHas('category', function ($catQ) use ($search) {
+                  $catQ->where('title', 'like', "%{$search}%");
+              })
+              
+              // Color and Size (stored in variation_suffix or productFields)
+              ->orWhere('products.variation_suffix', 'like', "%{$search}%")
+              ->orWhereHas('productFields', function ($fieldQ) use ($search) {
+                  $fieldQ->where('value', 'like', "%{$search}%") // 'value' is the column, 'parsed_value' is the accessor
+                         ->whereIn('field_id', function($subQ) {
+                            $subQ->select('id')->from('fields')
+                                 ->whereIn('title', ['Color', 'Size', 'Colour']);
+                         });
+              });
+        });
+    }
+
+    /**
+     * Collect the given category id plus all descendant category ids.
+     *
+     * This project stores a materialized path in `categories.path` where each row
+     * keeps ancestor ids separated by "/". Example:
+     * - root: path = null
+     * - child of 5: path = "5"
+     * - grandchild of 5: path = "5/12"
+     *
+     * So descendants of id=5 are rows whose path equals "5" OR starts with "5/"
+     * OR ends with "/5" OR contains "/5/".
+     */
+    /**
+     * Public endpoint to find stock details by barcode.
+     * 
+     * GET /api/catalog/find-stock/{barcode}
+     */
+    public function findStockByBarcode(Request $request, $barcode)
+    {
+        try {
+            // 1. Find the barcode record
+            $barcodeRecord = ProductBarcode::where('barcode', $barcode)
+                ->where('is_active', true)
+                ->first();
+
+            if (!$barcodeRecord) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Barcode {$barcode} not found or inactive.",
+                ], 404);
+            }
+
+            // 2. Load the main product with all necessary relations
+            $product = Product::with([
+                'images', 
+                'category', 
+                'batches.store' => function($q) {
+                    $q->where('is_active', true);
+                }
+            ])
+            ->where('id', $barcodeRecord->product_id)
+            ->where('is_archived', false)
+            ->first();
+
+            if (!$product) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Associated product not found or archived.",
+                ], 404);
+            }
+
+            // 3. Stock Calculations
+            $activeBatches = $product->batches->where('is_active', true)->where('availability', true);
+            $totalPhysicalStock = (int) $activeBatches->sum('quantity');
+            
+            // Reserved stock logic
+            $reservedRow = ReservedProduct::where('product_id', $product->id)->first();
+            $reservedInventory = $reservedRow ? (int) $reservedRow->reserved_inventory : 0;
+            $availableInventory = $totalPhysicalStock - $reservedInventory;
+
+            // 4. Load Variants (SKU group)
+            $variants = collect();
+            if ($product->sku) {
+                $variants = Product::with(['images', 'batches' => function($q) {
+                        $q->where('is_active', true)->where('availability', true);
+                    }])
+                    ->where('sku', $product->sku)
+                    ->where('is_archived', false)
+                    ->get()
+                    ->map(function ($variant) {
+                        $vStock = (int) $variant->batches->sum('quantity');
+                        $vReserved = ReservedProduct::where('product_id', $variant->id)->value('reserved_inventory') ?? 0;
+                        return [
+                            'id' => $variant->id,
+                            'name' => $variant->name,
+                            'variation_suffix' => $variant->variation_suffix,
+                            'sku' => $variant->sku,
+                            'stock_quantity' => $vStock,
+                            'available_inventory' => $vStock - $vReserved,
+                            'in_stock' => $vStock > 0,
+                            'primary_image' => $variant->images->where('is_active', true)->where('is_primary', true)->first()?->image_url 
+                                            ?? $variant->images->where('is_active', true)->first()?->image_url,
+                        ];
+                    });
+            }
+
+            // 5. Image Merging
+            $mergedImages = $this->mergedActiveImages($product);
+
+            // 6. Branch-wise breakdown
+            $branchStock = $product->batches
+                ->where('is_active', true)
+                ->where('availability', true)
+                ->filter(fn($batch) => $batch->store !== null)
+                ->groupBy('store_id')
+                ->map(function ($storeBatches) {
+                    $store = $storeBatches->first()->store;
+                    return [
+                        'store_id' => $store->id,
+                        'store_name' => $store->name,
+                        'store_address' => $store->address,
+                        'quantity' => $storeBatches->sum('quantity'),
+                    ];
+                })
+                ->values();
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'product_id' => $product->id,
+                    'name' => $product->name,
+                    'sku' => $product->sku,
+                    'description' => $product->description,
+                    'category' => $product->category ? $product->category->title : null,
+                    'images' => $mergedImages,
+                    'inventory' => [
+                        'physical_stock' => $totalPhysicalStock,
+                        'reserved_stock' => $reservedInventory,
+                        'available_stock' => max(0, $availableInventory),
+                    ],
+                    'branch_stock' => $branchStock,
+                    'variants' => $variants,
+                    'scanned_barcode' => $barcode,
+                ]
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => "Error finding stock: " . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function getCollection(Request $request, $slug)
+    {
+        try {
+            $collection = \App\Models\Collection::where('slug', $slug)
+                ->active()
+                ->firstOrFail();
+
+            $query = $collection->products()
+                ->with(['images', 'category', 'batches' => function ($q) {
+                    $q->where('is_active', true)->where('availability', true);
+                }])
+                ->where('products.is_archived', false);
+
+            $perPage = (int) $request->get('per_page', 40);
+            $products = $query->paginate($perPage);
+
+            $formattedProducts = collect($products->items())->map(function ($product) {
+                return $this->formatProductForApi($product);
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'collection' => $collection,
+                    'products' => $formattedProducts,
+                    'pagination' => [
+                        'current_page' => $products->currentPage(),
+                        'last_page' => $products->lastPage(),
+                        'per_page' => $products->perPage(),
+                        'total' => $products->total(),
+                        'has_more_pages' => $products->hasMorePages(),
+                    ]
+                ]
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Collection not found or error loading products: ' . $e->getMessage()
+            ], 404);
+        }
+    }
+
+    private function collectCategoryAndDescendantIds(Category $category): array
+    {
+        $id = (int) $category->id;
+
+        // Start with self.
+        $ids = collect([$id]);
+
+        // Fetch descendants in one query using the materialized path.
+        // Note: path does not include the category's own id, only ancestors.
+        $descendantIds = Category::query()
+            ->where('path', (string) $id)
+            ->orWhere('path', 'like', $id . '/%')
+            ->orWhere('path', 'like', '%/' . $id)
+            ->orWhere('path', 'like', '%/' . $id . '/%')
+            ->pluck('id');
+
+        return $ids->merge($descendantIds)->unique()->values()->all();
+    }
+
+    private function normalizeSizeToken(?string $value): string
+    {
+        $token = mb_strtolower(trim((string) $value), 'UTF-8');
+        $token = preg_replace('/^(size|sz)[:\s-]*/i', '', $token);
+        $token = str_replace(['/', '-', '_', ',', '.', ':', '(', ')'], ' ', $token);
+        $token = preg_replace('/\s+/', ' ', $token);
+        return trim($token);
+    }
+
+    private function isStrictSizeSearch(?string $search): bool
+    {
+        $token = $this->normalizeSizeToken($search);
+        if ($token === '' || str_contains($token, ' ')) {
+            return false;
+        }
+
+        $knownSizes = [
+            'xxs', 'xs', 's', 'm', 'l', 'xl', 'xxl', 'xxxl',
+            '2xl', '3xl', '4xl', '5xl', '6xl',
+            'free', 'freesize', 'one', 'onesize', 'os',
+        ];
+
+        if (in_array($token, $knownSizes, true)) {
+            return true;
+        }
+
+        // Numeric apparel/shoe sizes should also be exact. This prevents searching
+        // 40 from returning unrelated SKUs/names through broad LIKE matching.
+        return (bool) preg_match('/^\d{1,2}(\.5)?$/', $token);
+    }
+
+
+    private function shouldTreatAsStrictSizeSearch(?string $search): bool
+    {
+        return $this->isStrictSizeSearch($search) && !$this->hasExactSkuMatch($search);
+    }
+
+    private function hasExactSkuMatch(?string $search): bool
+    {
+        $rawSearch = trim((string) $search);
+        if ($rawSearch === '') {
+            return false;
+        }
+
+        $compactSearch = preg_replace('/[\s\-\/_]+/', '', $rawSearch);
+
+        return Product::query()
+            ->where('is_archived', false)
+            ->whereNull('deleted_at')
+            ->where(function ($q) use ($rawSearch, $compactSearch) {
+                $q->where('sku', $rawSearch);
+
+                if ($compactSearch !== '') {
+                    $q->orWhereRaw("REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(sku, ''), ' ', ''), '-', ''), '/', ''), '_', '') = ?", [$compactSearch]);
+                }
+            })
+            ->exists();
+    }
+
+    private function whereExactSizeToken($query, string $column, string $sizeToken): void
+    {
+        $normalizedSql = "LOWER(TRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE({$column}, ''), '/', ' '), '-', ' '), '_', ' '), ',', ' '), '.', ' '), '(', ' '), ')', ' ')))";
+        $query->where(function ($tokenQ) use ($normalizedSql, $sizeToken) {
+            $tokenQ->whereRaw("{$normalizedSql} = ?", [$sizeToken])
+                ->orWhereRaw("CONCAT(' ', {$normalizedSql}, ' ') LIKE ?", ['% ' . $sizeToken . ' %']);
+        });
+    }
+
+    private function normalizeString(string $string): string
+    {
+        $str = mb_strtolower($string, 'UTF-8');
+        $str = str_replace(['/', '-', '_', '&', ':'], ' ', $str);
+        $str = str_replace(['(', ')', '.'], '', $str);
+        $str = preg_replace('/\s+/', ' ', $str);
+        return trim($str);
+    }
+
+    private function getQueryTokenTypes(array $rawQueryTokens, array $normalizedQueryTokens): array
+    {
+        $types = [];
+        $brandStopWords = [
+            'the', 'a', 'an', 'by', 'x', 'de', 'la', 'le', 'and', 'with', 'for', 'of', 'in', 'low', 'high', 'mid', '1'
+        ];
+        $commonModelCodes = [
+            'og', 'sp', 'se', 'gs', 'tr', 'sb', 'unc', 'lv', 'ap'
+        ];
+
+        for ($i = 0; $i < count($normalizedQueryTokens); $i++) {
+            $token = $normalizedQueryTokens[$i];
+            $rawToken = $rawQueryTokens[$i] ?? '';
+
+            if (preg_match('/^\d/', $token)) {
+                $types[$token] = 'numeric';
+            } elseif (
+                preg_match('/^[A-Z]{2,4}$/', $rawToken) || 
+                in_array($token, $commonModelCodes)
+            ) {
+                $types[$token] = 'model_code';
+            } elseif (in_array($token, $brandStopWords)) {
+                $types[$token] = 'stop_word';
+            } else {
+                $types[$token] = 'normal';
+            }
+        }
+        return $types;
+    }
+
+    private function scoreAndRankProducts(array $candidates, string $search): array
+    {
+        $normalizedQuery = $this->normalizeString($search);
+        if ($normalizedQuery === '') {
+            return $candidates;
+        }
+
+        // For exact size searches, buildFilterQuery already filtered the matching
+        // variants. Do not re-score against base_name, otherwise size "L" would
+        // either disappear or rank unrelated base names.
+        if ($this->shouldTreatAsStrictSizeSearch($search)) {
+            usort($candidates, function ($a, $b) {
+                return strcasecmp(((array) $a)['base_name'] ?? '', ((array) $b)['base_name'] ?? '');
+            });
+            return array_map(function ($cand) {
+                $arr = (array) $cand;
+                $arr['total_score'] = $arr['total_score'] ?? 100;
+                return $arr;
+            }, $candidates);
+        }
+
+        $normalizedQueryTokens = explode(' ', $normalizedQuery);
+        
+        // Step 5 edge case: check minimum query length
+        if (mb_strlen($normalizedQuery) <= 2) {
+            $filtered = [];
+            foreach ($candidates as $cand) {
+                $candObj = (object) $cand;
+                $baseName = $candObj->base_name ?? '';
+                $sku = (string) ($candObj->sku ?? '');
+                $normalizedBaseName = $this->normalizeString($baseName);
+                $normalizedSku = mb_strtolower(trim($sku), 'UTF-8');
+                $compactSku = preg_replace('/[\s\-\/_]+/', '', $normalizedSku);
+                $compactQuery = preg_replace('/[\s\-\/_]+/', '', mb_strtolower(trim($search), 'UTF-8'));
+                if (
+                    str_starts_with($normalizedBaseName, $normalizedQuery) ||
+                    ($normalizedSku !== '' && str_contains($normalizedSku, mb_strtolower(trim($search), 'UTF-8'))) ||
+                    ($compactQuery !== '' && $compactSku !== '' && str_contains($compactSku, $compactQuery))
+                ) {
+                    $candArray = (array) $cand;
+                    $candArray['total_score'] = ($normalizedSku === mb_strtolower(trim($search), 'UTF-8') || ($compactQuery !== '' && $compactSku === $compactQuery)) ? 100 : 1;
+                    $filtered[] = $candArray;
+                }
+            }
+            usort($filtered, function ($a, $b) {
+                return strcasecmp($a['base_name'] ?? '', $b['base_name'] ?? '');
+            });
+            return $filtered;
+        }
+
+        // Collapse spaces in original search to get raw tokens (preserving case)
+        $rawQueryCollapsed = preg_replace('/\s+/', ' ', trim($search));
+        $rawQueryTokens = explode(' ', $rawQueryCollapsed);
+        
+        // Step 2: Identify Token Types
+        $queryTokenTypes = $this->getQueryTokenTypes($rawQueryTokens, $normalizedQueryTokens);
+        
+        // Pre-process and score each candidate
+        $scored = [];
+        foreach ($candidates as $cand) {
+            $candObj = (object) $cand;
+            $baseName = $candObj->base_name ?? '';
+            $fullName = $candObj->name ?? '';
+            $sku = (string) ($candObj->sku ?? '');
+            
+            $normalizedBaseName = $this->normalizeString($baseName);
+            $normalizedFullName = $this->normalizeString($fullName);
+            $normalizedSku = mb_strtolower(trim($sku), 'UTF-8');
+            $compactSku = preg_replace('/[\s\-\/_]+/', '', $normalizedSku);
+            $compactQuery = preg_replace('/[\s\-\/_]+/', '', mb_strtolower(trim($search), 'UTF-8'));
+            
+            $candidateTokens = explode(' ', $normalizedBaseName);
+            
+            // Step 3 & 4: Compute score
+            $scoreA = 0;
+            foreach ($normalizedQueryTokens as $qToken) {
+                if (in_array($qToken, $candidateTokens)) {
+                    $type = $queryTokenTypes[$qToken] ?? 'normal';
+                    if ($type === 'numeric') {
+                        $scoreA += 3;
+                    } elseif ($type === 'model_code') {
+                        $scoreA += 2;
+                    } elseif ($type === 'normal') {
+                        $scoreA += 1;
+                    }
+                }
+            }
+            
+            $scoreB = 0;
+            foreach ($normalizedQueryTokens as $qToken) {
+                if (($queryTokenTypes[$qToken] ?? '') === 'numeric') {
+                    if (!in_array($qToken, $candidateTokens)) {
+                        $scoreB -= 5;
+                    }
+                }
+            }
+            
+            $scoreC = 0;
+            $maxLen = min(4, count($normalizedQueryTokens), count($candidateTokens));
+            for ($i = 0; $i < $maxLen; $i++) {
+                if ($normalizedQueryTokens[$i] === $candidateTokens[$i]) {
+                    $scoreC += 1;
+                }
+            }
+            
+            $scoreD = 0;
+            if ($normalizedBaseName !== '') {
+                if ($normalizedQuery === $normalizedBaseName) {
+                    $scoreD = 20;
+                } elseif (str_starts_with($normalizedBaseName, $normalizedQuery)) {
+                    $scoreD = 10;
+                } elseif (str_starts_with($normalizedQuery, $normalizedBaseName)) {
+                    $scoreD = 5;
+                }
+            }
+            
+            $scoreExactPhrase = 0;
+            if (str_contains($normalizedFullName, $normalizedQuery)) {
+                $scoreExactPhrase = 15;
+            }
+            
+            $scoreSku = 0;
+            if ($normalizedSku !== '' || $compactSku !== '') {
+                if ($normalizedSku === mb_strtolower(trim($search), 'UTF-8') || ($compactQuery !== '' && $compactSku === $compactQuery)) {
+                    $scoreSku = 100;
+                } elseif ($normalizedSku !== '' && str_contains($normalizedSku, mb_strtolower(trim($search), 'UTF-8'))) {
+                    $scoreSku = 60;
+                } elseif ($compactQuery !== '' && $compactSku !== '' && str_contains($compactSku, $compactQuery)) {
+                    $scoreSku = 60;
+                }
+            }
+
+            $totalScore = $scoreA + $scoreB + $scoreC + $scoreD + $scoreExactPhrase + $scoreSku;
+            
+            $candArray = (array) $cand;
+            $candArray['total_score'] = $totalScore;
+            $candArray['score_a'] = $scoreA;
+            $candArray['score_sku'] = $scoreSku;
+            $scored[] = $candArray;
+        }
+        
+        // Step 5: Filter out zero and below
+        $filtered = [];
+        foreach ($scored as $item) {
+            if ($item['total_score'] > 0) {
+                $filtered[] = $item;
+            }
+        }
+        
+        // Exception for single token
+        if (empty($filtered) && count($normalizedQueryTokens) === 1) {
+            foreach ($scored as $item) {
+                if ($item['score_a'] > 0) {
+                    $filtered[] = $item;
+                }
+            }
+            // Sort by raw overlap descending, then by base_name ascending
+            usort($filtered, function ($a, $b) {
+                if ($b['score_a'] !== $a['score_a']) {
+                    return $b['score_a'] <=> $a['score_a'];
+                }
+                return strcasecmp($a['base_name'] ?? '', $b['base_name'] ?? '');
+            });
+            return $filtered;
+        }
+        
+        // Step 6: Sort
+        usort($filtered, function ($a, $b) {
+            if ($b['total_score'] !== $a['total_score']) {
+                return $b['total_score'] <=> $a['total_score'];
+            }
+            return strcasecmp($a['base_name'] ?? '', $b['base_name'] ?? '');
+        });
+        
+        return $filtered;
+    }
+}

@@ -1,0 +1,864 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Order;
+use App\Models\ProductBatch;
+use App\Models\ReservedProduct;
+use App\Models\ProductBarcode;
+use App\Models\Store;
+use App\Models\OrderPayment;
+use App\Models\PaymentMethod;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Validator;
+
+class OrderManagementController extends Controller
+{
+    /**
+     * Statuses where an order still holds stock without the batch quantity
+     * having been finally deducted. These reservations must be subtracted
+     * from a store's physical stock before it can be shown as fillable.
+     */
+    private const STORE_RESERVATION_STATUSES = [
+        'pending',
+        'pending_assignment',
+        'assigned_to_store',
+        'picking',
+        'processing',
+        'ready_for_pickup',
+        'ready_for_shipment',
+    ];
+
+    public function __construct()
+    {
+        $this->middleware('auth:api'); // Employee authentication
+    }
+
+    /**
+     * Marking online orders delivered means cash/settlement is finalized.
+     * Create the missing completed payment so cash sheet and due amount become correct.
+     */
+    private function settleDeliveredOrderPayment(Order $order, $deliveredAt): void
+    {
+        $order->loadMissing(['customer', 'payments']);
+
+        $remainingAmount = max(0, round((float) $order->total_amount - (float) $order->payments()->completed()->sum('amount'), 2));
+
+        if ($remainingAmount <= 0) {
+            $order->forceFill([
+                'paid_amount' => (float) $order->total_amount,
+                'outstanding_amount' => 0,
+                'payment_status' => 'paid',
+            ])->save();
+            return;
+        }
+
+        $methodCode = strtolower((string) ($order->payment_method ?: 'cod'));
+        $paymentMethod = PaymentMethod::where('code', $methodCode)->first()
+            ?: PaymentMethod::where('code', 'cod')->first()
+            ?: PaymentMethod::where('code', 'cash')->first()
+            ?: PaymentMethod::where('type', 'cash')->where('is_active', true)->first();
+
+        if (!$paymentMethod) {
+            $paymentMethod = PaymentMethod::firstOrCreate(
+                ['code' => 'cod'],
+                [
+                    'name' => 'Cash on Delivery',
+                    'description' => 'Auto settlement when delivered',
+                    'type' => 'cash',
+                    'allowed_customer_types' => ['counter', 'social_commerce', 'ecommerce'],
+                    'is_active' => true,
+                    'requires_reference' => false,
+                    'supports_partial' => true,
+                    'min_amount' => 0,
+                    'max_amount' => null,
+                    'fixed_fee' => 0,
+                    'percentage_fee' => 0,
+                    'sort_order' => 99,
+                ]
+            );
+        }
+
+        $employee = auth('api')->user();
+        $fee = $paymentMethod->calculateFee($remainingAmount);
+        $payment = OrderPayment::create([
+            'order_id' => $order->id,
+            'payment_method_id' => $paymentMethod->id,
+            'customer_id' => $order->customer_id,
+            'store_id' => $order->store_id,
+            'processed_by' => $employee?->id,
+            'amount' => $remainingAmount,
+            'fee_amount' => $fee,
+            'net_amount' => $remainingAmount - $fee,
+            'payment_type' => 'full',
+            'payment_received_date' => $deliveredAt->toDateString(),
+            'payment_data' => [
+                'payment_date' => $deliveredAt->toDateTimeString(),
+            ],
+            'metadata' => [
+                'auto_settled_on_delivery' => true,
+                'source' => 'online_order_history_delivery',
+            ],
+            'notes' => 'Auto-settled when online order was marked delivered.',
+            'status' => 'pending',
+        ]);
+
+        $payment->forceFill([
+            'created_at' => $deliveredAt,
+            'updated_at' => $deliveredAt,
+        ])->saveQuietly();
+
+        $payment->process($employee, $deliveredAt);
+        $payment->complete(null, null, $deliveredAt);
+
+        $order->refresh();
+        $order->updatePaymentStatus();
+        $order->forceFill([
+            'payment_status' => 'paid',
+            'outstanding_amount' => 0,
+            'paid_amount' => (float) $order->total_amount,
+            'payment_method' => $order->payment_method ?: $paymentMethod->code,
+        ])->save();
+    }
+
+    /**
+     * Get orders pending store assignment
+     * Includes both ecommerce and social_commerce orders
+     */
+    public function getPendingAssignmentOrders(Request $request): JsonResponse
+    {
+        try {
+            $perPage = $request->query('per_page', 15);
+            $sortOrder = $request->query('sort_order', 'desc');
+            $status = $request->query('status', 'pending_assignment');
+            
+            // Validate sort order to prevent SQL injection or invalid values
+            if (!in_array(strtolower($sortOrder), ['asc', 'desc'])) {
+                $sortOrder = 'asc';
+            }
+            
+            $orders = Order::where('status', $status)
+                ->whereIn('order_type', ['ecommerce', 'social_commerce'])
+                ->with(['customer', 'items.product'])
+                ->orderBy('created_at', $sortOrder)
+                ->paginate($perPage);
+
+            // Add summary for each order
+            foreach ($orders as $order) {
+                $order->items_summary = $order->items->map(function ($item) {
+                    return [
+                        'product_id' => $item->product_id,
+                        'product_name' => $item->product_name,
+                        'quantity' => $item->quantity,
+                    ];
+                });
+            }
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'orders' => $orders->items(),
+                    'pagination' => [
+                        'current_page' => $orders->currentPage(),
+                        'total_pages' => $orders->lastPage(),
+                        'per_page' => $orders->perPage(),
+                        'total' => $orders->total(),
+                    ],
+                ],
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to fetch pending orders',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Get available stores for an order based on inventory
+     */
+    public function getAvailableStores($orderId): JsonResponse
+    {
+        try {
+            $order = Order::with(['items.product', 'items.barcode'])->findOrFail($orderId);
+
+            if (!in_array($order->status, ['pending_assignment', 'assigned_to_store', 'picking', 'ready_for_shipment'], true)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Order cannot be reassigned in current status: ' . $order->status,
+                ], 400);
+            }
+
+            // Show every active selling store even when it has zero stock.
+            // Online warehouses are also included if explicitly marked is_online.
+            $stores = Store::where(function ($q) {
+                    $q->where('is_active', true)->orWhereNull('is_active');
+                })
+                ->where(function ($q) {
+                    $q->where('is_warehouse', false)
+                        ->orWhereNull('is_warehouse')
+                        ->orWhere('is_online', true);
+                })
+                ->orderBy('is_warehouse')
+                ->orderBy('name')
+                ->get();
+
+            // Aggregate duplicate order lines for the same product so one physical
+            // stock pool is never counted more than once.
+            $orderRequirements = $this->aggregateOrderRequirements($order);
+            $productIds = $orderRequirements->pluck('product_id')->all();
+
+            // 1. Fetch Global Reserved Inventory View (context only; never used
+            // as a substitute for store-specific physical availability).
+            $reservedProducts = ReservedProduct::whereIn('product_id', $productIds)
+                ->get()
+                ->keyBy('product_id');
+
+            // 2. Fetch Physical Inventory View (Per Store/Product)
+            // Filter batches by availability and expiry to match frontend logic
+            $batches = ProductBatch::whereIn('product_id', $productIds)
+                ->where('availability', true)
+                ->where('quantity', '>', 0)
+                ->where(function ($query) {
+                    $query->where('is_active', true)->orWhereNull('is_active');
+                })
+                ->where(function($query) {
+                    $query->whereNull('expiry_date')
+                        ->orWhere('expiry_date', '>', now());
+                })
+                ->get()
+                ->groupBy(['store_id', 'product_id']);
+
+            // 3. Fetch quantities actively reserved against a specific store.
+            // Only reservation-held statuses are counted. Completed/deducted orders
+            // are already reflected in ProductBatch.quantity and must not be subtracted twice.
+            $assignedOrders = DB::table('order_items')
+                ->join('orders', 'order_items.order_id', '=', 'orders.id')
+                ->whereIn('order_items.product_id', $productIds)
+                ->whereNotNull('orders.store_id')
+                ->whereIn('orders.status', self::STORE_RESERVATION_STATUSES)
+                ->whereNull('orders.deleted_at')
+                ->where('orders.id', '!=', $order->id) // Exclude current order if re-assigning
+                ->select('orders.store_id', 'order_items.product_id', DB::raw('SUM(order_items.quantity) as total_assigned'))
+                ->groupBy('orders.store_id', 'order_items.product_id')
+                ->get()
+                ->groupBy('store_id');
+
+            $storeInventory = [];
+
+            foreach ($stores as $store) {
+                $canFulfillEntireOrder = $orderRequirements->isNotEmpty();
+                $storeData = [
+                    'store_id' => $store->id,
+                    'store_name' => $store->name,
+                    'store_address' => $store->address,
+                    'inventory_details' => [],
+                    // These are quantities (units), not the number of distinct lines.
+                    'total_items_available' => 0,
+                    'total_items_required' => (int) $orderRequirements->sum('required_quantity'),
+                ];
+
+                $assignedStoreData = $assignedOrders->get($store->id, collect())->keyBy('product_id');
+
+                foreach ($orderRequirements as $requirement) {
+                    $productId = (int) $requirement['product_id'];
+                    $requiredQuantity = (int) $requirement['required_quantity'];
+
+                    // Physical stock in this store for this product
+                    $productBatchesInStore = $batches->get($store->id, collect())->get($productId, collect());
+                    $totalPhysicalInStore = $productBatchesInStore->sum('quantity');
+
+                    // Already assigned to this store (from other pending/processing orders)
+                    $alreadyAssignedInStore = $assignedStoreData->get($productId)->total_assigned ?? 0;
+
+                    // TRUE Available in this store for this specific order
+                    $actuallyAvailableInStore = max(0, $totalPhysicalInStore - $alreadyAssignedInStore);
+
+                    // Global stats from ReservedProduct for context
+                    $globalReserved = $reservedProducts->get($productId);
+                    $globalAvailable = $globalReserved ? $globalReserved->available_inventory : 0;
+
+                    $inventoryDetail = [
+                        'product_id' => $productId,
+                        'product_name' => $requirement['product_name'],
+                        'product_sku' => $requirement['product_sku'],
+                        'required_quantity' => $requiredQuantity,
+                        'physical_quantity' => (int) $totalPhysicalInStore,
+                        'reserved_quantity' => (int) $alreadyAssignedInStore,
+                        // Backward-compatible alias used by older frontend builds.
+                        'assigned_quantity' => (int) $alreadyAssignedInStore,
+                        // Store-specific non-reserved physical stock.
+                        'available_quantity' => (int) $actuallyAvailableInStore,
+                        'global_available' => (int) $globalAvailable,
+                        'can_fulfill' => $actuallyAvailableInStore >= $requiredQuantity,
+                        'batches' => $productBatchesInStore->map(function($batch) {
+                            return [
+                                'batch_id' => $batch->id,
+                                'batch_number' => $batch->batch_number,
+                                'quantity' => $batch->quantity,
+                                'sell_price' => $batch->sell_price,
+                                'expiry_date' => $batch->expiry_date,
+                            ];
+                        })->values(),
+                    ];
+
+                    $storeData['inventory_details'][] = $inventoryDetail;
+                    // Excess stock of one product must never compensate for a shortage
+                    // of another product in the fulfillment percentage.
+                    $storeData['total_items_available'] += min($requiredQuantity, $actuallyAvailableInStore);
+
+                    if ($actuallyAvailableInStore < $requiredQuantity) {
+                        $canFulfillEntireOrder = false;
+                    }
+                }
+
+                $storeData['can_fulfill_entire_order'] = $canFulfillEntireOrder;
+                $storeData['fulfillment_percentage'] = $storeData['total_items_required'] > 0
+                    ? min(100, round(($storeData['total_items_available'] / $storeData['total_items_required']) * 100, 2))
+                    : 0;
+                $storeData['fulfillment_status'] = $canFulfillEntireOrder
+                    ? 'full'
+                    : ($storeData['total_items_available'] > 0 ? 'partial' : 'none');
+
+                $storeInventory[] = $storeData;
+            }
+
+            // Sort by fulfillment capability (stores that can fulfill entire order first)
+            usort($storeInventory, function($a, $b) {
+                if ($a['can_fulfill_entire_order'] !== $b['can_fulfill_entire_order']) {
+                    return $b['can_fulfill_entire_order'] <=> $a['can_fulfill_entire_order'];
+                }
+                return $b['fulfillment_percentage'] <=> $a['fulfillment_percentage'];
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'order_id' => $order->id,
+                    'order_number' => $order->order_number,
+                    'total_items' => $order->items->sum('quantity'),
+                    'stores' => $storeInventory,
+                    'recommendation' => $this->getRecommendation($storeInventory),
+                ],
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to fetch available stores',
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Assign order to a specific store
+     */
+    public function assignOrderToStore(Request $request, $orderId): JsonResponse
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'store_id' => 'required|exists:stores,id',
+                'notes' => 'nullable|string|max:500',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation failed',
+                    'errors' => $validator->errors(),
+                ], 422);
+            }
+
+            $order = Order::with(['items.product', 'items.barcode'])->findOrFail($orderId);
+
+            if (!in_array($order->status, ['pending_assignment', 'assigned_to_store', 'picking', 'ready_for_shipment'], true)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Order cannot be reassigned in current status: ' . $order->status,
+                ], 400);
+            }
+
+            $storeId = $request->store_id;
+            $store = Store::findOrFail($storeId);
+
+            // Double check TRUE inventory availability at the moment of assignment
+            // This prevents race conditions or overlapping assignments
+            $orderRequirements = $this->aggregateOrderRequirements($order);
+            $productIds = $orderRequirements->pluck('product_id')->all();
+            
+            // 1. Current Physical Stock
+            $physicalStock = ProductBatch::whereIn('product_id', $productIds)
+                ->where('store_id', $storeId)
+                ->where('availability', true)
+                ->where('quantity', '>', 0)
+                ->where(function ($query) {
+                    $query->where('is_active', true)->orWhereNull('is_active');
+                })
+                ->where(function($query) {
+                    $query->whereNull('expiry_date')
+                        ->orWhere('expiry_date', '>', now());
+                })
+                ->select('product_id', DB::raw('SUM(quantity) as total'))
+                ->groupBy('product_id')
+                ->get()
+                ->keyBy('product_id');
+
+            // 2. Current Assigned (Promised) Quantities
+            $assignedQuantityMap = DB::table('order_items')
+                ->join('orders', 'order_items.order_id', '=', 'orders.id')
+                ->whereIn('order_items.product_id', $productIds)
+                ->where('orders.store_id', $storeId)
+                ->whereIn('orders.status', self::STORE_RESERVATION_STATUSES)
+                ->whereNull('orders.deleted_at')
+                ->where('orders.id', '!=', $order->id)
+                ->select('order_items.product_id', DB::raw('SUM(order_items.quantity) as total'))
+                ->groupBy('order_items.product_id')
+                ->get()
+                ->keyBy('product_id');
+
+            foreach ($orderRequirements as $requirement) {
+                $pid = (int) $requirement['product_id'];
+                $pStock = (int) ($physicalStock->get($pid)->total ?? 0);
+                $aStock = (int) ($assignedQuantityMap->get($pid)->total ?? 0);
+                $actualAvailable = max(0, $pStock - $aStock);
+                $requiredQuantity = (int) $requirement['required_quantity'];
+
+                if ($actualAvailable < $requiredQuantity) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => "Insufficient non-reserved physical inventory for '{$requirement['product_name']}' at {$store->name}.",
+                        'data' => [
+                            'product' => $requirement['product_name'],
+                            'required' => $requiredQuantity,
+                            'physically_present' => $pStock,
+                            'assigned_to_other_orders' => $aStock,
+                            'actually_free' => $actualAvailable,
+                        ],
+                    ], 400);
+                }
+            }
+
+            DB::beginTransaction();
+
+            try {
+                // Note: Stock batches will be determined dynamically during the barcode scanning phase at the branch.
+                // Reserved inventory remains untouched; it will be released when the order is completed/delivered.
+                // If this order had previously scanned barcodes from another branch, release those exact units
+                // and make the order scan again from the newly selected store.
+                $releasedScans = [];
+                if ($order->store_id && (int) $order->store_id !== (int) $storeId) {
+                    foreach ($order->items()->with('barcode')->whereNotNull('product_barcode_id')->get() as $item) {
+                        if ($item->barcode) {
+                            $item->barcode->update([
+                                'is_active' => true,
+                                'current_status' => 'in_shop',
+                                'location_updated_at' => now(),
+                                'location_metadata' => array_merge($item->barcode->location_metadata ?? [], [
+                                    'released_from_order_id' => $order->id,
+                                    'released_order_item_id' => $item->id,
+                                    'released_reason' => 'store_reassignment',
+                                    'released_at' => now()->toDateTimeString(),
+                                    'released_by' => auth('api')->id(),
+                                ]),
+                            ]);
+                            $releasedScans[] = $item->barcode->barcode;
+                        }
+                        $item->forceFill([
+                            'product_barcode_id' => null,
+                            'product_batch_id' => null,
+                        ])->saveQuietly();
+                    }
+                }
+
+                // Update order status to assigned_to_store
+                $order->update([
+                    'store_id' => $storeId,
+                    'status' => 'assigned_to_store',
+                    'fulfillment_status' => 'pending_fulfillment', // Required for warehouse fulfillment workflow
+                    'processed_by' => auth('api')->id(),
+                    'metadata' => array_merge($order->metadata ?? [], [
+                        'assigned_at' => now()->toISOString(),
+                        'assigned_by' => auth('api')->id(),
+                        'assignment_notes' => $request->notes,
+                        'released_barcodes_on_reassignment' => $releasedScans ?? [],
+                        'barcode_action' => !empty($releasedScans ?? []) ? 'released_previous_store_scans_for_rescan' : null,
+                    ]),
+                ]);
+
+                DB::commit();
+
+                $order->load(['customer', 'items.product', 'store']);
+
+                return response()->json([
+                    'success' => true,
+                    'message' => "Order successfully assigned to {$store->name}",
+                    'data' => [
+                        'order' => $order,
+                    ],
+                ], 200);
+
+            } catch (\Exception $e) {
+                DB::rollBack();
+                throw $e;
+            }
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to assign order to store',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Collapse duplicate order lines into one requirement per product.
+     *
+     * Without this aggregation, two lines for the same product can each reuse the
+     * same physical quantity and incorrectly make a store look fully fillable.
+     */
+    private function aggregateOrderRequirements(Order $order)
+    {
+        return $order->items
+            ->filter(fn ($item) => !empty($item->product_id) && (int) $item->quantity > 0)
+            ->groupBy(fn ($item) => (int) $item->product_id)
+            ->map(function ($items, $productId) {
+                $first = $items->first();
+
+                return [
+                    'product_id' => (int) $productId,
+                    'product_name' => (string) ($first->product_name ?? $first->product?->name ?? 'Unknown Product'),
+                    'product_sku' => (string) ($first->product_sku ?? $first->product?->sku ?? ''),
+                    'required_quantity' => (int) $items->sum('quantity'),
+                ];
+            })
+            ->values();
+    }
+
+    /**
+     * Get recommendation for best store to assign order
+     */
+    private function getRecommendation(array $storeInventory): ?array
+    {
+        if (empty($storeInventory)) {
+            return null;
+        }
+
+        // Find stores that can fulfill entire order
+        $canFulfillStores = array_filter($storeInventory, function($store) {
+            return $store['can_fulfill_entire_order'];
+        });
+
+        if (empty($canFulfillStores)) {
+            // No store can fulfill entire order
+            // Recommend store with highest fulfillment percentage
+            $bestStore = reset($storeInventory);
+            return [
+                'store_id' => $bestStore['store_id'],
+                'store_name' => $bestStore['store_name'],
+                'reason' => 'Highest partial fulfillment capability',
+                'fulfillment_percentage' => $bestStore['fulfillment_percentage'],
+                'note' => 'Consider splitting order or restocking before assignment',
+            ];
+        }
+
+        // Among stores that can fulfill, find the one with the earliest expiring required batch
+        $bestStore = null;
+        $earliestExpiry = null;
+        
+        foreach ($canFulfillStores as $store) {
+            $storeEarliest = null;
+            // Get expiry of the batches this store would use for exact variant ID
+            foreach ($store['inventory_details'] ?? [] as $detail) {
+                foreach ($detail['batches'] ?? [] as $batch) {
+                    if (!empty($batch['expiry_date'])) {
+                        $expiryTime = strtotime($batch['expiry_date']);
+                        if ($storeEarliest === null || $expiryTime < $storeEarliest) {
+                            $storeEarliest = $expiryTime;
+                        }
+                    }
+                }
+            }
+            
+            // If this store has an earlier expiry than our current best, or if we haven't found one yet
+            if (!$bestStore || ($storeEarliest !== null && ($earliestExpiry === null || $storeEarliest < $earliestExpiry))) {
+                $earliestExpiry = $storeEarliest;
+                $bestStore = $store;
+            }
+        }
+        
+        // Fallback to the first store if logic failed
+        if (!$bestStore) {
+            $bestStore = reset($canFulfillStores);
+        }
+
+        return [
+            'store_id' => $bestStore['store_id'],
+            'store_name' => $bestStore['store_name'],
+            'reason' => 'Can fulfill entire order' . ($earliestExpiry ? ' (Optimized FIFO expiry)' : ''),
+            'fulfillment_percentage' => 100,
+        ];
+    }
+
+    /**
+     * Revert order back to pending_assignment
+     */
+    public function revertAssignment(Request $request, $orderId)
+    {
+        try {
+            DB::beginTransaction();
+
+            $order = Order::with('items')->findOrFail($orderId);
+
+            $oldStatus = $order->status;
+            $oldStoreId = $order->store_id;
+            $oldFulfillmentStatus = $order->fulfillment_status;
+
+            // 1. Handle stock restoration if order was already "deducted" (e.g. from OrderController@complete)
+            // Deducted statuses usually include 'confirmed', 'delivered'
+            $deductedStatuses = ['confirmed', 'delivered'];
+            $isDeducted = in_array($oldStatus, $deductedStatuses);
+
+            foreach ($order->items as $item) {
+                // a. Handle Barcodes
+                if ($item->product_barcode_id) {
+                    $barcode = ProductBarcode::find($item->product_barcode_id);
+                    if ($barcode) {
+                        // Reset barcode status to be available again in the shop
+                        $barcode->update([
+                            'is_active' => true,
+                            'current_status' => 'in_shop',
+                            'location_updated_at' => now(),
+                        ]);
+                    }
+                }
+
+                // b. Restore Physical Stock if it was deducted
+                if ($isDeducted) {
+                    // Update Batch Quantity
+                    if ($item->product_batch_id) {
+                        $batch = ProductBatch::find($item->product_batch_id);
+                        if ($batch) {
+                            $batch->increment('quantity', $item->quantity);
+                        }
+                    }
+
+                    // Update Global Reserved Stats (Total and Reserved)
+                    if ($reserved = ReservedProduct::where('product_id', $item->product_id)->first()) {
+                        $reserved->increment('total_inventory', $item->quantity);
+                        $reserved->increment('reserved_inventory', $item->quantity);
+                        
+                        $reserved->fresh();
+                        $reserved->available_inventory = $reserved->total_inventory - $reserved->reserved_inventory;
+                        $reserved->save();
+                    }
+                }
+
+                // Clear barcode/batch assignments from order item
+                $item->update([
+                    'product_barcode_id' => null,
+                    'product_batch_id' => null,
+                ]);
+            }
+
+            // 2. Reset core order fields
+            $order->status = 'pending_assignment';
+            $order->store_id = null;
+            $order->fulfillment_status = null;
+            $order->confirmed_at = null;
+            $order->fulfilled_at = null;
+            $order->fulfilled_by = null;
+
+            $order->metadata = array_merge($order->metadata ?? [], [
+                'reverted_at' => now()->toISOString(),
+                'reverted_by' => auth('api')->id(),
+                'reverted_from_status' => $oldStatus,
+                'reverted_from_store' => $oldStoreId,
+            ]);
+
+            $order->save();
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Order assignment successfully reverted and stock restored.',
+                'data' => [
+                    'order' => $order->load(['customer', 'items.product']),
+                ],
+            ], 200);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to revert order assignment.',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Mark order as delivered manually
+     */
+    public function markAsDelivered(Request $request, $orderId)
+    {
+        try {
+            DB::beginTransaction();
+
+            $order = Order::findOrFail($orderId);
+
+            // Validation: Only confirmed (completed) or fulfilled orders can be marked as delivered
+            if ($order->status !== 'confirmed' && $order->fulfillment_status !== 'fulfilled') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Only confirmed or fulfilled orders can be marked as delivered.',
+                ], 422);
+            }
+
+            if ($order->status === 'delivered') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Order is already marked as delivered.',
+                ], 422);
+            }
+
+            $deliveredAt = now();
+            $order->status = 'delivered';
+            $order->delivered_at = $deliveredAt;
+            
+            $order->metadata = array_merge($order->metadata ?? [], [
+                'delivered_at' => $deliveredAt->toISOString(),
+                'delivered_by' => auth('api')->id(),
+                'delivery_manual_mark' => true,
+            ]);
+
+            $order->save();
+            $this->settleDeliveredOrderPayment($order, $deliveredAt);
+
+            // Record purchase for customer history
+            if ($order->customer) {
+                $order->customer->recordPurchase($order->total_amount, $order->id);
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Order successfully marked as delivered.',
+                'data' => [
+                    'order' => $order->load(['customer', 'items.product']),
+                ],
+            ], 200);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to mark order as delivered.',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Mark multiple orders as delivered
+     * 
+     * POST /api/order-management/orders/bulk-mark-as-delivered
+     */
+    public function bulkMarkAsDelivered(Request $request): JsonResponse
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'order_ids' => 'required|array|min:1',
+                'order_ids.*' => 'exists:orders,id',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation failed',
+                    'errors' => $validator->errors(),
+                ], 422);
+            }
+
+            $orderIds = $request->order_ids;
+            $results = [
+                'success' => [],
+                'failed' => [],
+            ];
+
+            foreach ($orderIds as $orderId) {
+                try {
+                    DB::beginTransaction();
+
+                    $order = Order::findOrFail($orderId);
+
+                    // Validation same as single markAsDelivered
+                    if ($order->status !== 'confirmed' && $order->fulfillment_status !== 'fulfilled') {
+                        throw new \Exception('Order must be confirmed or fulfilled to be marked as delivered.');
+                    }
+
+                    if ($order->status === 'delivered') {
+                        throw new \Exception('Order is already marked as delivered.');
+                    }
+
+                    $deliveredAt = now();
+                    $order->status = 'delivered';
+                    $order->delivered_at = $deliveredAt;
+                    
+                    $order->metadata = array_merge($order->metadata ?? [], [
+                        'delivered_at' => $deliveredAt->toISOString(),
+                        'delivered_by' => auth('api')->id(),
+                        'delivery_manual_mark' => true,
+                        'bulk_process' => true,
+                    ]);
+
+                    $order->save();
+                    $this->settleDeliveredOrderPayment($order, $deliveredAt);
+
+                    // Record purchase for customer history
+                    if ($order->customer) {
+                        $order->customer->recordPurchase($order->total_amount, $order->id);
+                    }
+
+                    DB::commit();
+
+                    $results['success'][] = [
+                        'order_id' => $order->id,
+                        'order_number' => $order->order_number,
+                    ];
+
+                } catch (\Exception $e) {
+                    DB::rollBack();
+                    $results['failed'][] = [
+                        'order_id' => $orderId,
+                        'order_number' => Order::find($orderId)->order_number ?? 'Unknown',
+                        'reason' => $e->getMessage(),
+                    ];
+                }
+            }
+
+            $successCount = count($results['success']);
+            $failedCount = count($results['failed']);
+
+            return response()->json([
+                'success' => true,
+                'message' => "Bulk delivery completed: $successCount succeeded, $failedCount failed.",
+                'data' => $results,
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to process bulk delivery',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+}
+

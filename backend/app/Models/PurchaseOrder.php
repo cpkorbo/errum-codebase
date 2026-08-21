@@ -1,0 +1,640 @@
+<?php
+
+namespace App\Models;
+
+use App\Traits\DatabaseAgnosticSearch;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Support\Facades\DB;
+use App\Traits\AutoLogsActivity;
+
+class PurchaseOrder extends Model
+{
+    use HasFactory, DatabaseAgnosticSearch, AutoLogsActivity;
+
+    protected $fillable = [
+        'po_number',
+        'vendor_id',
+        'store_id',
+        'created_by',
+        'approved_by',
+        'received_by',
+        'order_date',
+        'expected_delivery_date',
+        'actual_delivery_date',
+        'approved_at',
+        'sent_at',
+        'received_at',
+        'cancelled_at',
+        'status',
+        'payment_status',
+        'subtotal',
+        'tax_amount',
+        'discount_amount',
+        'shipping_cost',
+        'other_charges',
+        'total_amount',
+        'paid_amount',
+        'outstanding_amount',
+        'payment_due_date',
+        'reference_number',
+        'notes',
+        'terms_and_conditions',
+        'cancellation_reason',
+        'metadata',
+    ];
+
+    protected $casts = [
+        'order_date' => 'date',
+        'expected_delivery_date' => 'date',
+        'actual_delivery_date' => 'date',
+        'payment_due_date' => 'date',
+        'approved_at' => 'datetime',
+        'sent_at' => 'datetime',
+        'received_at' => 'datetime',
+        'cancelled_at' => 'datetime',
+        'subtotal' => 'decimal:2',
+        'tax_amount' => 'decimal:2',
+        'discount_amount' => 'decimal:2',
+        'shipping_cost' => 'decimal:2',
+        'other_charges' => 'decimal:2',
+        'total_amount' => 'decimal:2',
+        'paid_amount' => 'decimal:2',
+        'outstanding_amount' => 'decimal:2',
+        'metadata' => 'array',
+    ];
+
+    /**
+     * Relationships
+     */
+    public function vendor(): BelongsTo
+    {
+        return $this->belongsTo(Vendor::class);
+    }
+
+    public function store(): BelongsTo
+    {
+        return $this->belongsTo(Store::class);
+    }
+
+    public function createdBy(): BelongsTo
+    {
+        return $this->belongsTo(Employee::class, 'created_by');
+    }
+
+    public function approvedBy(): BelongsTo
+    {
+        return $this->belongsTo(Employee::class, 'approved_by');
+    }
+
+    public function receivedBy(): BelongsTo
+    {
+        return $this->belongsTo(Employee::class, 'received_by');
+    }
+
+    // Alias for backward compatibility
+    public function employee(): BelongsTo
+    {
+        return $this->createdBy();
+    }
+
+    public function items(): HasMany
+    {
+        return $this->hasMany(PurchaseOrderItem::class);
+    }
+
+    public function payments(): HasMany
+    {
+        return $this->hasMany(VendorPaymentItem::class);
+    }
+
+    /**
+     * Get all vendor payments through payment items
+     */
+    public function vendorPayments()
+    {
+        return $this->hasManyThrough(
+            VendorPayment::class,
+            VendorPaymentItem::class,
+            'purchase_order_id',
+            'id',
+            'id',
+            'vendor_payment_id'
+        );
+    }
+
+    /**
+     * Business Logic Methods
+     */
+
+    /**
+     * Generate unique PO number: PO-YYYYMMDD-XXXXXX
+     */
+    public static function generatePONumber(): string
+    {
+        $date = now()->format('Ymd');
+        $query = static::query();
+        (new static)->whereLike($query, 'po_number', "PO-{$date}-", 'start');
+        $lastPO = $query->orderBy('po_number', 'desc')
+            ->first();
+
+        if ($lastPO) {
+            $lastNumber = (int) substr($lastPO->po_number, -6);
+            $nextNumber = $lastNumber + 1;
+        } else {
+            $nextNumber = 1;
+        }
+
+        return 'PO-' . $date . '-' . str_pad($nextNumber, 6, '0', STR_PAD_LEFT);
+    }
+
+    /**
+     * Calculate totals from items
+     */
+    public function calculateTotals(): void
+    {
+        $items = $this->items()->get();
+
+        // 1. Subtotal is the GROSS sum of all items (quantity * unit_cost)
+        $this->subtotal = $items->sum(function($item) {
+            return ($item->unit_cost ?? 0) * ($item->quantity_ordered ?? 0);
+        });
+
+        // 2. Sum up all item-level taxes and discounts
+        $itemTaxTotal = $items->sum('tax_amount');
+        $itemDiscountTotal = $items->sum('discount_amount');
+
+        // 3. Grand total = Gross Subtotal + PO Tax + Item Tax + Shipping + Other Charges - PO Discount - Item Discount
+        $this->total_amount = $this->subtotal 
+            + ($this->tax_amount ?? 0) 
+            + ($itemTaxTotal ?? 0)
+            + ($this->shipping_cost ?? 0) 
+            + ($this->other_charges ?? 0) 
+            - ($this->discount_amount ?? 0)
+            - ($itemDiscountTotal ?? 0);
+        
+        $this->outstanding_amount = $this->total_amount - ($this->paid_amount ?? 0);
+        
+        // Update payment status
+        $this->updatePaymentStatus();
+    }
+
+    /**
+     * Update payment status based on paid amount
+     */
+    public function updatePaymentStatus(): void
+    {
+        if ($this->paid_amount <= 0) {
+            $this->payment_status = 'unpaid';
+        } elseif ($this->paid_amount >= $this->total_amount) {
+            $this->payment_status = 'paid';
+        } else {
+            $this->payment_status = 'partially_paid';
+        }
+    }
+
+    /**
+     * Record a payment against this PO
+     */
+    public function recordPayment(float $amount, array $paymentData = []): VendorPaymentItem
+    {
+        DB::beginTransaction();
+        try {
+            // Create vendor payment if not provided
+            if (!isset($paymentData['vendor_payment_id'])) {
+                $vendorPayment = VendorPayment::create([
+                    'payment_number' => VendorPayment::generatePaymentNumber(),
+                    'vendor_id' => $this->vendor_id,
+                    'payment_method_id' => $paymentData['payment_method_id'] ?? null,
+                    'account_id' => $paymentData['account_id'] ?? null,
+                    'employee_id' => $paymentData['employee_id'] ?? auth()->id(),
+                    'amount' => $amount,
+                    'allocated_amount' => $amount,
+                    'payment_date' => $paymentData['payment_date'] ?? now(),
+                    'payment_type' => 'purchase_order',
+                    'status' => 'completed',
+                    'notes' => $paymentData['notes'] ?? null,
+                ]);
+                $vendorPaymentId = $vendorPayment->id;
+            } else {
+                $vendorPaymentId = $paymentData['vendor_payment_id'];
+            }
+
+            // Determine allocation type
+            $allocationType = 'partial';
+            if ($amount >= $this->outstanding_amount) {
+                $allocationType = 'full';
+                $amount = $this->outstanding_amount; // Cap at outstanding
+            }
+
+            // Create payment item
+            $paymentItem = VendorPaymentItem::create([
+                'vendor_payment_id' => $vendorPaymentId,
+                'purchase_order_id' => $this->id,
+                'allocated_amount' => $amount,
+                'po_total_at_payment' => $this->total_amount,
+                'po_outstanding_before' => $this->outstanding_amount,
+                'po_outstanding_after' => $this->outstanding_amount - $amount,
+                'allocation_type' => $allocationType,
+                'notes' => $paymentData['item_notes'] ?? null,
+            ]);
+
+            // Update PO payment amounts
+            $this->paid_amount += $amount;
+            $this->outstanding_amount -= $amount;
+            $this->updatePaymentStatus();
+            $this->save();
+
+            DB::commit();
+            return $paymentItem;
+        } catch (\Exception $e) {
+            DB::rollBack();
+            throw $e;
+        }
+    }
+
+    /**
+     * Mark PO as received and create product batches with barcodes
+     */
+    public function markAsReceived(array $receivedItems = [], ?int $receivedById = null): void
+    {
+        DB::beginTransaction();
+        try {
+            /** @var self $lockedPo */
+            $lockedPo = static::whereKey($this->id)->lockForUpdate()->firstOrFail();
+            if (!in_array($lockedPo->status, ['approved', 'partially_received'], true)) {
+                // Treat a retry of an already-finished receive as idempotent. This protects the UI from
+                // creating duplicate stock when the previous HTTP response timed out after the backend finished.
+                if ($lockedPo->status === 'received') {
+                    DB::commit();
+                    $this->refresh();
+                    return;
+                }
+
+                throw new \Exception('This purchase order has already been received or cannot be received in its current status.');
+            }
+
+            $receiptLedgerLines = [];
+
+            foreach ($receivedItems as $itemData) {
+                $item = PurchaseOrderItem::where('purchase_order_id', $lockedPo->id)
+                    ->where('id', $itemData['item_id'] ?? 0)
+                    ->lockForUpdate()
+                    ->first();
+                if (!$item) continue;
+
+                $requestedQuantity = (int) ($itemData['quantity_received'] ?? ($item->quantity_ordered - $item->quantity_received));
+                if ($requestedQuantity <= 0) continue;
+
+                $remainingQuantity = max(0, (int) $item->quantity_ordered - (int) $item->quantity_received);
+                if ($remainingQuantity <= 0) {
+                    throw new \Exception("Item {$item->id} is already fully received.");
+                }
+                if ($requestedQuantity > $remainingQuantity) {
+                    throw new \Exception("Cannot receive {$requestedQuantity} units for {$item->product?->name}. Remaining quantity is {$remainingQuantity}.");
+                }
+
+                [$batch, $reusedExistingBatch] = $this->findOrCreateReceiptBatch($lockedPo, $item, $itemData, $requestedQuantity);
+
+                $this->ensureReceiptBatchBarcodes($lockedPo, $item, $batch, $requestedQuantity);
+
+                $item->product_batch_id = $batch->id;
+                $item->batch_number = $batch->batch_number;
+                $item->quantity_received = (int) $item->quantity_received + $requestedQuantity;
+                $item->quantity_pending = max(0, (int) $item->quantity_ordered - (int) $item->quantity_received);
+                $item->manufactured_date = $itemData['manufactured_date'] ?? $item->manufactured_date;
+                $item->expiry_date = $itemData['expiry_date'] ?? $item->expiry_date;
+
+                if ($item->quantity_received >= $item->quantity_ordered) {
+                    $item->receive_status = 'fully_received';
+                } elseif ($item->quantity_received > 0) {
+                    $item->receive_status = 'partially_received';
+                }
+                $item->save();
+
+                $orderedQuantity = max(1, (int) $item->quantity_ordered);
+                $lineGross = round(((float) $item->unit_cost) * $requestedQuantity, 2);
+                $lineTax = round(((float) $item->tax_amount) * ($requestedQuantity / $orderedQuantity), 2);
+                $lineDiscount = round(((float) $item->discount_amount) * ($requestedQuantity / $orderedQuantity), 2);
+
+                $receiptLedgerLines[] = [
+                    'item_id' => $item->id,
+                    'product_id' => $item->product_id,
+                    'quantity_received' => $requestedQuantity,
+                    'unit_cost' => (float) $item->unit_cost,
+                    'gross_amount' => $lineGross,
+                    'tax_amount' => $lineTax,
+                    'discount_amount' => $lineDiscount,
+                    'net_amount' => round($lineGross + $lineTax - $lineDiscount, 2),
+                    'reused_existing_batch' => $reusedExistingBatch,
+                ];
+
+                \Log::info(($reusedExistingBatch ? 'Reconciled' : 'Generated') . " {$requestedQuantity} PO units for {$lockedPo->po_number}, Batch {$batch->batch_number}");
+            }
+
+            $totals = $lockedPo->items()
+                ->selectRaw('COALESCE(SUM(quantity_ordered), 0) as total_ordered, COALESCE(SUM(quantity_received), 0) as total_received')
+                ->first();
+            $totalOrdered = (int) ($totals->total_ordered ?? 0);
+            $totalReceived = (int) ($totals->total_received ?? 0);
+
+            if ($totalOrdered > 0 && $totalReceived >= $totalOrdered) {
+                $lockedPo->status = 'received';
+                $lockedPo->actual_delivery_date = now();
+                $lockedPo->received_at = $lockedPo->received_at ?: now();
+            } elseif ($totalReceived > 0) {
+                $lockedPo->status = 'partially_received';
+            }
+
+            if ($receivedById && !$lockedPo->received_by) {
+                $lockedPo->received_by = $receivedById;
+            }
+            if ($totalReceived > 0 && !$lockedPo->received_at) {
+                $lockedPo->received_at = now();
+            }
+
+            $lockedPo->save();
+
+            $receiptLedgerAmount = $lockedPo->calculateReceiptLedgerAmount($receiptLedgerLines);
+            if ($receiptLedgerAmount > 0 && !data_get($lockedPo->metadata, 'resell', false)) {
+                \App\Models\Transaction::createFromPurchaseOrderReceipt(
+                    $lockedPo->loadMissing('vendor', 'store'),
+                    $receiptLedgerAmount,
+                    [
+                        'receipt_type' => 'po_receive',
+                        'received_lines' => $receiptLedgerLines,
+                        'received_gross_amount' => round(array_sum(array_column($receiptLedgerLines, 'gross_amount')), 2),
+                    ]
+                );
+            }
+
+            DB::commit();
+            $this->refresh();
+        } catch (\Exception $e) {
+            DB::rollBack();
+            \Log::error("Failed to receive PO {$this->po_number}: " . $e->getMessage());
+            throw $e;
+        }
+    }
+
+    /**
+     * Build a stable auto batch number for PO receipts. It includes the cumulative received
+     * quantity after this receipt, so partial receipts can create separate batches while
+     * a retry of the same failed/timed-out request resolves to the same batch number.
+     */
+    protected function buildReceiptBatchNumber(self $po, PurchaseOrderItem $item, int $requestedQuantity): string
+    {
+        $targetReceivedQuantity = (int) $item->quantity_received + $requestedQuantity;
+        return "{$po->po_number}-{$item->id}-{$targetReceivedQuantity}";
+    }
+
+    protected function findOrCreateReceiptBatch(self $po, PurchaseOrderItem $item, array $itemData, int $requestedQuantity): array
+    {
+        $manualBatchNumber = trim((string) ($itemData['batch_number'] ?? ''));
+        $batchNumber = $manualBatchNumber !== ''
+            ? $manualBatchNumber
+            : $this->buildReceiptBatchNumber($po, $item, $requestedQuantity);
+
+        $batch = ProductBatch::where('batch_number', $batchNumber)->lockForUpdate()->first();
+
+        // Recovery path for older builds that created stock with PO-ITEM-HHMMSS before the
+        // item/PO rows were marked received. This lets a retry reconcile instead of duplicating stock.
+        if (!$batch && $manualBatchNumber === '' && (int) $item->quantity_received === 0) {
+            $legacyPrefix = "{$po->po_number}-{$item->id}-";
+            $batch = ProductBatch::where('product_id', $item->product_id)
+                ->where('store_id', $po->store_id)
+                ->where('quantity', $requestedQuantity)
+                ->where('batch_number', 'like', $legacyPrefix . '%')
+                ->lockForUpdate()
+                ->latest('id')
+                ->first();
+        }
+
+        $isResell = (bool) data_get($po->metadata, 'resell', false);
+
+        if ($batch) {
+            if ((int) $batch->product_id !== (int) $item->product_id || (int) $batch->store_id !== (int) $po->store_id) {
+                throw new \Exception("Batch number {$batch->batch_number} already exists for a different product or store.");
+            }
+
+            if ($isResell && $batch->source_purchase_order_id && (
+                (int) $batch->source_purchase_order_id !== (int) $po->id
+                || (int) $batch->source_purchase_order_item_id !== (int) $item->id
+            )) {
+                throw new \Exception("Batch {$batch->batch_number} already belongs to a different resell purchase-order item.");
+            }
+
+            if ((int) $batch->quantity < $requestedQuantity) {
+                throw new \Exception("Existing batch {$batch->batch_number} has only {$batch->quantity} units, but {$requestedQuantity} units were requested.");
+            }
+
+            if ($isResell && !$batch->source_purchase_order_id) {
+                // Never turn unrelated owned stock into consignment stock merely because an employee
+                // typed an existing batch number. Only the legacy auto-number recovery path may adopt it.
+                if ($manualBatchNumber !== '') {
+                    throw new \Exception("Existing batch {$batch->batch_number} is not linked to this resell PO. Use a new batch number.");
+                }
+                $batch->forceFill([
+                    'source_purchase_order_id' => $po->id,
+                    'source_purchase_order_item_id' => $item->id,
+                ])->save();
+            }
+
+            return [$batch, true];
+        }
+
+        $batch = ProductBatch::create([
+            'product_id' => $item->product_id,
+            'source_purchase_order_id' => $isResell ? $po->id : null,
+            'source_purchase_order_item_id' => $isResell ? $item->id : null,
+            'batch_number' => $batchNumber,
+            'quantity' => $requestedQuantity,
+            'cost_price' => $item->unit_cost,
+            'sell_price' => $item->unit_sell_price,
+            'store_id' => $po->store_id,
+            'manufactured_date' => $itemData['manufactured_date'] ?? null,
+            'expiry_date' => $itemData['expiry_date'] ?? null,
+        ]);
+
+        return [$batch, false];
+    }
+
+    protected function ensureReceiptBatchBarcodes(self $po, PurchaseOrderItem $item, ProductBatch $batch, int $expectedQuantity): void
+    {
+        // Unlink stale orphaned barcodes that share batch_id but belong to a different store/product
+        ProductBarcode::where('batch_id', $batch->id)
+            ->where(function ($q) use ($batch) {
+                $q->where('product_id', '!=', $batch->product_id);
+                if ($batch->store_id) {
+                    $q->orWhere('current_store_id', '!=', $batch->store_id);
+                }
+            })
+            ->update(['batch_id' => null]);
+
+        $isResell = (bool) data_get($po->metadata, 'resell', false);
+        if ($isResell) {
+            ProductBarcode::where('batch_id', $batch->id)
+                ->whereNull('source_purchase_order_id')
+                ->update([
+                    'source_purchase_order_id' => $po->id,
+                    'source_purchase_order_item_id' => $item->id,
+                ]);
+        }
+
+        $existingCount = ProductBarcode::where('batch_id', $batch->id)
+            ->where('product_id', $batch->product_id)
+            ->where('current_store_id', $batch->store_id)
+            ->count();
+        $missingCount = max(0, $expectedQuantity - $existingCount);
+
+        if ($missingCount > 0) {
+            $store = $po->store;
+            $initialStatus = $store && $store->is_warehouse ? 'in_warehouse' : 'in_shop';
+            $now = now();
+            $rows = [];
+
+            $barcodeValues = ProductBarcode::generateUniqueBarcodes($missingCount);
+
+            foreach ($barcodeValues as $i => $barcodeValue) {
+                $rows[] = [
+                    'product_id' => $item->product_id,
+                    'source_purchase_order_id' => $isResell ? $po->id : null,
+                    'source_purchase_order_item_id' => $isResell ? $item->id : null,
+                    'batch_id' => $batch->id,
+                    'barcode' => $barcodeValue,
+                    'type' => 'CODE128',
+                    'is_primary' => $existingCount === 0 && $i === 0,
+                    'is_active' => true,
+                    'is_defective' => false,
+                    'generated_at' => $now,
+                    'current_store_id' => $po->store_id,
+                    'current_status' => $initialStatus,
+                    'location_updated_at' => $now,
+                    'location_metadata' => json_encode([
+                        'source' => 'purchase_order',
+                        'po_number' => $po->po_number,
+                        'purchase_order_id' => $po->id,
+                        'purchase_order_item_id' => $item->id,
+                        'resell' => $isResell,
+                        'received_date' => $now->format('Y-m-d H:i:s'),
+                    ]),
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ];
+            }
+
+            ProductBarcode::withoutEvents(function () use ($rows) {
+                ProductBarcode::insert($rows);
+            });
+        }
+
+        $firstBarcodeId = ProductBarcode::where('batch_id', $batch->id)->orderBy('id')->value('id');
+        if ($firstBarcodeId && (int) $batch->barcode_id !== (int) $firstBarcodeId) {
+            $batch->barcode_id = $firstBarcodeId;
+            $batch->save();
+        }
+    }
+
+    /**
+     * Calculate the payable/inventory value for only the quantity received in one receipt event.
+     * Item-level tax/discount is prorated by received quantity. Header-level tax/shipping/discount
+     * is prorated by received gross value so partial receipts do not book the full PO payable early.
+     */
+    public function calculateReceiptLedgerAmount(array $receiptLedgerLines): float
+    {
+        if (empty($receiptLedgerLines)) {
+            return 0.0;
+        }
+
+        $receivedGross = array_sum(array_column($receiptLedgerLines, 'gross_amount'));
+        $receivedLineNet = array_sum(array_column($receiptLedgerLines, 'net_amount'));
+
+        $orderedGross = (float) $this->items()->selectRaw('COALESCE(SUM(unit_cost * quantity_ordered), 0) as gross')->value('gross');
+        $receiptRatio = $orderedGross > 0 ? min(1, max(0, $receivedGross / $orderedGross)) : 0;
+
+        $headerAdjustments = (float) ($this->tax_amount ?? 0)
+            + (float) ($this->shipping_cost ?? 0)
+            + (float) ($this->other_charges ?? 0)
+            - (float) ($this->discount_amount ?? 0);
+
+        return round($receivedLineNet + ($headerAdjustments * $receiptRatio), 2);
+    }
+
+    /**
+     * Cancel purchase order
+     */
+    public function cancel(string $reason = null): void
+    {
+        $this->status = 'cancelled';
+        $this->notes = ($this->notes ? $this->notes . "\n\n" : '') . "Cancelled: " . ($reason ?? 'No reason provided');
+        $this->save();
+
+        // Cancel all pending items
+        $this->items()->where('receive_status', 'pending')->update([
+            'receive_status' => 'cancelled'
+        ]);
+    }
+
+    /**
+     * Check if PO is fully received
+     */
+    public function isFullyReceived(): bool
+    {
+        return $this->status === 'received';
+    }
+
+    /**
+     * Check if PO is fully paid
+     */
+    public function isFullyPaid(): bool
+    {
+        return $this->payment_status === 'paid';
+    }
+
+    /**
+     * Get payment history
+     */
+    public function getPaymentHistory()
+    {
+        return $this->payments()
+            ->with('vendorPayment')
+            ->orderBy('created_at', 'desc')
+            ->get();
+    }
+
+    /**
+     * Scopes
+     */
+    public function scopePending($query)
+    {
+        return $query->where('status', 'pending');
+    }
+
+    public function scopeApproved($query)
+    {
+        return $query->where('status', 'approved');
+    }
+
+    public function scopeReceived($query)
+    {
+        return $query->where('status', 'received');
+    }
+
+    public function scopeUnpaid($query)
+    {
+        return $query->where('payment_status', 'unpaid');
+    }
+
+    public function scopePartiallyPaid($query)
+    {
+        return $query->where('payment_status', 'partially_paid');
+    }
+
+    public function scopeOverdue($query)
+    {
+        return $query->where('expected_delivery_date', '<', now())
+            ->whereNotIn('status', ['received', 'cancelled']);
+    }
+}

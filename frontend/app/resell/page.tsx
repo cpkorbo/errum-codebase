@@ -1,0 +1,595 @@
+'use client';
+
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
+import {
+  BadgeDollarSign,
+  BarChart3,
+  Box,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  CircleDollarSign,
+  Eye,
+  FilePlus2,
+  Loader2,
+  PackageCheck,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  ShoppingBag,
+  Trash2,
+  Truck,
+  Users,
+  X,
+} from 'lucide-react';
+import Header from '@/components/Header';
+import Sidebar from '@/components/Sidebar';
+import AccessControl from '@/components/AccessControl';
+import { useTheme } from '@/contexts/ThemeContext';
+import catalogService, { Product as CatalogProduct } from '@/services/catalogService';
+import paymentMethodService, { PaymentMethod } from '@/services/paymentMethodService';
+import purchaseOrderService from '@/services/purchase-order.service';
+import resellService, {
+  ResellProductTag,
+  ResellSummary,
+  ResellVendorProfile,
+} from '@/services/resellService';
+import storeService, { Store } from '@/services/storeService';
+
+const money = (value: any) => `৳${Number(value || 0).toLocaleString('en-BD', { maximumFractionDigits: 2 })}`;
+const today = () => new Date().toISOString().slice(0, 10);
+const getError = (error: any) =>
+  error?.response?.data?.message ||
+  (error?.response?.data?.errors ? Object.values(error.response.data.errors).flat().join(', ') : '') ||
+  error?.message ||
+  'Something went wrong';
+
+const getResellPaymentSettlement = (payment: any): { label: string; tone: 'green' | 'amber' | 'red' | 'gray' | 'blue' } => {
+  if (payment?.payment_type === 'refund' && payment?.metadata?.refund_from_vendor) {
+    return { label: 'Refund From Vendor', tone: 'blue' };
+  }
+  if (payment?.payment_type === 'refund') {
+    return { label: 'Refund', tone: 'red' };
+  }
+  if (payment?.status === 'cancelled' || payment?.status === 'refunded') {
+    return { label: payment.status, tone: 'red' };
+  }
+  if (payment?.status !== 'completed') {
+    return { label: payment?.status || 'pending', tone: 'amber' };
+  }
+  return { label: 'Paid', tone: 'green' };
+};
+
+function Modal({ open, title, onClose, children, wide = false }: { open: boolean; title: string; onClose: () => void; children: React.ReactNode; wide?: boolean }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/55 p-4" onMouseDown={onClose}>
+      <div className={`max-h-[92vh] w-full overflow-y-auto rounded-2xl bg-white shadow-2xl dark:bg-gray-900 ${wide ? 'max-w-6xl' : 'max-w-2xl'}`} onMouseDown={(e) => e.stopPropagation()}>
+        <div className="sticky top-0 z-10 flex items-center justify-between border-b border-gray-200 bg-white px-6 py-4 dark:border-gray-700 dark:bg-gray-900">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">{title}</h2>
+          <button onClick={onClose} className="rounded-lg p-2 hover:bg-gray-100 dark:hover:bg-gray-800"><X className="h-5 w-5" /></button>
+        </div>
+        <div className="p-6">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Pill({ children, tone = 'gray' }: { children: React.ReactNode; tone?: 'gray' | 'green' | 'amber' | 'blue' | 'red' }) {
+  const cls = {
+    gray: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-200',
+    green: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300',
+    amber: 'bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300',
+    blue: 'bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300',
+    red: 'bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300',
+  }[tone];
+  return <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${cls}`}>{children}</span>;
+}
+
+export default function ResellItemsPage() {
+  const { darkMode, setDarkMode } = useTheme();
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [tab, setTab] = useState<'vendors' | 'products' | 'purchase-orders' | 'payments'>('vendors');
+  const [loading, setLoading] = useState(true);
+  const [working, setWorking] = useState(false);
+  const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  const [summary, setSummary] = useState<ResellSummary | null>(null);
+  const [vendors, setVendors] = useState<ResellVendorProfile[]>([]);
+  const [products, setProducts] = useState<ResellProductTag[]>([]);
+  const [purchaseOrders, setPurchaseOrders] = useState<any[]>([]);
+  const [poLoading, setPoLoading] = useState(false);
+  const [poSearchInput, setPoSearchInput] = useState('');
+  const [poFilters, setPoFilters] = useState({ search: '', from_date: '', to_date: '', page: 1, per_page: 25 });
+  const [poPagination, setPoPagination] = useState({ current_page: 1, last_page: 1, from: 0, to: 0, total: 0, per_page: 25 });
+  const [viewPo, setViewPo] = useState<any | null>(null);
+  const [viewPoLoading, setViewPoLoading] = useState(false);
+  const [payments, setPayments] = useState<any[]>([]);
+  const [stores, setStores] = useState<Store[]>([]);
+  const [paymentMethods, setPaymentMethods] = useState<PaymentMethod[]>([]);
+
+  const [vendorModal, setVendorModal] = useState(false);
+  const [vendorSearch, setVendorSearch] = useState('');
+  const [vendorCandidates, setVendorCandidates] = useState<any[]>([]);
+  const [vendorNotes, setVendorNotes] = useState('');
+
+  const [productModal, setProductModal] = useState(false);
+  const [productSearch, setProductSearch] = useState('');
+  const [productResults, setProductResults] = useState<CatalogProduct[]>([]);
+  const [productVendorId, setProductVendorId] = useState<number | ''>('');
+  const [productSearching, setProductSearching] = useState(false);
+
+  const [poModal, setPoModal] = useState(false);
+  const [poForm, setPoForm] = useState<any>({
+    resell_vendor_id: '', store_id: '', order_date: today(), expected_delivery_date: '',
+    notes: '', tax_amount: 0, discount_amount: 0, shipping_cost: 0, other_charges: 0,
+    items: [],
+  });
+  const [receivePo, setReceivePo] = useState<any | null>(null);
+  const [receiveItems, setReceiveItems] = useState<any[]>([]);
+
+  const [paymentModal, setPaymentModal] = useState(false);
+  const [paymentForm, setPaymentForm] = useState<any>({
+    resell_vendor_id: '', payment_method_id: '', payment_date: today(), notes: '',
+  });
+  const [paymentPurchaseOrders, setPaymentPurchaseOrders] = useState<any[]>([]);
+  const [paymentAllocations, setPaymentAllocations] = useState<Record<number, string>>({});
+  const [paymentPoLoading, setPaymentPoLoading] = useState(false);
+  const [paymentMode, setPaymentMode] = useState<'payment' | 'refund'>('payment');
+
+  const flash = (type: 'success' | 'error', text: string) => {
+    setNotice({ type, text });
+    window.setTimeout(() => setNotice(null), 5500);
+  };
+
+  const loadPurchaseOrders = useCallback(async () => {
+    setPoLoading(true);
+    try {
+      const poData = await resellService.getPurchaseOrders(poFilters);
+      setPurchaseOrders(Array.isArray(poData?.data) ? poData.data : []);
+      setPoPagination({
+        current_page: Number(poData?.current_page || 1),
+        last_page: Number(poData?.last_page || 1),
+        from: Number(poData?.from || 0),
+        to: Number(poData?.to || 0),
+        total: Number(poData?.total || 0),
+        per_page: Number(poData?.per_page || poFilters.per_page),
+      });
+    } catch (error) {
+      flash('error', getError(error));
+    } finally {
+      setPoLoading(false);
+    }
+  }, [poFilters]);
+
+  const loadAll = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [summaryData, vendorData, productData, paymentData, storeData, methods] = await Promise.all([
+        resellService.getSummary(),
+        resellService.getVendors(),
+        resellService.getProducts({ per_page: 200 }),
+        resellService.getPayments({ per_page: 200 }),
+        storeService.getStores({ is_active: true, per_page: 1000 }),
+        paymentMethodService.getAll(),
+      ]);
+      setSummary(summaryData);
+      setVendors(Array.isArray(vendorData) ? vendorData : []);
+      setProducts(Array.isArray(productData?.data) ? productData.data : []);
+      setPayments(Array.isArray(paymentData?.data) ? paymentData.data : []);
+      setStores(Array.isArray(storeData?.data?.data) ? storeData.data.data : Array.isArray(storeData?.data) ? storeData.data : []);
+      setPaymentMethods(Array.isArray(methods) ? methods : []);
+    } catch (error) {
+      flash('error', getError(error));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadAll(); }, [loadAll]);
+  useEffect(() => { loadPurchaseOrders(); }, [loadPurchaseOrders]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const search = poSearchInput.trim();
+      setPoFilters((current) => current.search === search ? current : { ...current, search, page: 1 });
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [poSearchInput]);
+
+  useEffect(() => {
+    if (!vendorModal) return;
+    const timer = window.setTimeout(async () => {
+      try { setVendorCandidates(await resellService.getVendorCandidates(vendorSearch)); }
+      catch (error) { flash('error', getError(error)); }
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [vendorSearch, vendorModal]);
+
+  useEffect(() => {
+    if (!productModal || !productSearch.trim()) {
+      setProductResults([]);
+      return;
+    }
+    const timer = window.setTimeout(async () => {
+      setProductSearching(true);
+      try {
+        const result = await catalogService.searchProducts({ q: productSearch, per_page: 40, group_by_sku: true, in_stock: 'all' });
+        const flat = result.grouped_products?.flatMap((group) => [group.main_variant, ...(group.variants || [])]) || result.products || [];
+        const unique = Array.from(new Map(flat.map((p) => [p.id, p])).values());
+        setProductResults(unique);
+      } catch (error) {
+        flash('error', getError(error));
+      } finally {
+        setProductSearching(false);
+      }
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [productSearch, productModal]);
+
+  const activeVendors = useMemo(() => vendors.filter((v) => v.is_active), [vendors]);
+  const selectedPoVendorProducts = useMemo(
+    () => products.filter((p) => Number(p.resell_vendor_id) === Number(poForm.resell_vendor_id) && p.is_active),
+    [products, poForm.resell_vendor_id]
+  );
+  const selectedPaymentVendor = useMemo(
+    () => activeVendors.find((v) => Number(v.id) === Number(paymentForm.resell_vendor_id)),
+    [activeVendors, paymentForm.resell_vendor_id]
+  );
+  const paymentTotal = useMemo(
+    () => paymentPurchaseOrders.reduce((sum, po) => sum + Number(paymentAllocations[po.id] || 0), 0),
+    [paymentPurchaseOrders, paymentAllocations]
+  );
+  const paymentAvailableTotal = useMemo(
+    () => paymentPurchaseOrders.reduce((sum, po) => sum + Number((paymentMode === 'refund' ? po.refund_due : po.vendor_due) || 0), 0),
+    [paymentPurchaseOrders, paymentMode]
+  );
+
+  useEffect(() => {
+    if (!paymentModal || !selectedPaymentVendor) {
+      setPaymentPurchaseOrders([]);
+      setPaymentAllocations({});
+      return;
+    }
+
+    let cancelled = false;
+    const loadPaymentPurchaseOrders = async () => {
+      setPaymentPoLoading(true);
+      try {
+        const rows: any[] = [];
+        let page = 1;
+        let lastPage = 1;
+        do {
+          const result = await resellService.getPurchaseOrders({ vendor_id: selectedPaymentVendor.vendor_id, per_page: 200, page });
+          rows.push(...(Array.isArray(result?.data) ? result.data : []));
+          lastPage = Number(result?.last_page || 1);
+          page += 1;
+        } while (page <= lastPage);
+        if (!cancelled) {
+          setPaymentPurchaseOrders(rows.filter((po) => Number((paymentMode === 'refund' ? po.refund_due : po.vendor_due) || 0) > 0));
+          setPaymentAllocations({});
+        }
+      } catch (error) {
+        if (!cancelled) flash('error', getError(error));
+      } finally {
+        if (!cancelled) setPaymentPoLoading(false);
+      }
+    };
+
+    loadPaymentPurchaseOrders();
+    return () => { cancelled = true; };
+  }, [paymentModal, selectedPaymentVendor, paymentMode]);
+
+  const run = async (action: () => Promise<any>, success: string) => {
+    setWorking(true);
+    try {
+      await action();
+      flash('success', success);
+      await Promise.all([loadAll(), loadPurchaseOrders()]);
+      return true;
+    } catch (error) {
+      flash('error', getError(error));
+      return false;
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const markVendor = async (candidate: any) => {
+    const ok = await run(() => resellService.markVendor({ vendor_id: candidate.id, notes: vendorNotes }), `${candidate.name} is now a resell vendor.`);
+    if (ok) { setVendorModal(false); setVendorNotes(''); setVendorSearch(''); }
+  };
+
+  const markProduct = async (product: CatalogProduct) => {
+    if (!productVendorId) return flash('error', 'Select the resell vendor for this product.');
+    const ok = await run(() => resellService.markProduct({ product_id: product.id, resell_vendor_id: Number(productVendorId) }), `${product.name} is now a resell product.`);
+    if (ok) setProductResults((rows) => rows.filter((row) => row.id !== product.id));
+  };
+
+  const addPoItem = (tag: ResellProductTag) => {
+    if (poForm.items.some((item: any) => item.product_id === tag.product_id)) return;
+    const latestBatch = Array.isArray(tag.product?.batches) ? tag.product.batches[0] : null;
+    setPoForm((form: any) => ({ ...form, items: [...form.items, { product_id: tag.product_id, product_name: tag.product?.name, sku: tag.product?.sku, quantity_ordered: 1, unit_cost: latestBatch?.cost_price || 0, unit_sell_price: latestBatch?.sell_price || 0 }] }));
+  };
+
+  const updatePoItem = (index: number, field: string, value: any) => {
+    setPoForm((form: any) => ({ ...form, items: form.items.map((item: any, i: number) => i === index ? { ...item, [field]: value } : item) }));
+  };
+
+  const submitPo = async () => {
+    if (!poForm.resell_vendor_id || !poForm.store_id || poForm.items.length === 0) return flash('error', 'Choose a vendor, store, and at least one product.');
+    const payload = { ...poForm, resell_vendor_id: Number(poForm.resell_vendor_id), store_id: Number(poForm.store_id), items: poForm.items.map(({ product_name, sku, ...item }: any) => ({ ...item, quantity_ordered: Number(item.quantity_ordered), unit_cost: Number(item.unit_cost), unit_sell_price: Number(item.unit_sell_price || 0) })) };
+    const ok = await run(() => resellService.createPurchaseOrder(payload), 'Resell purchase order created.');
+    if (ok) {
+      setPoModal(false);
+      setPoForm({ resell_vendor_id: '', store_id: '', order_date: today(), expected_delivery_date: '', notes: '', tax_amount: 0, discount_amount: 0, shipping_cost: 0, other_charges: 0, items: [] });
+      setTab('purchase-orders');
+    }
+  };
+
+  const openReceive = (po: any) => {
+    setReceivePo(po);
+    setReceiveItems((po.items || []).filter((item: any) => Number(item.quantity_pending ?? (item.quantity_ordered - item.quantity_received)) > 0).map((item: any) => ({ item_id: item.id, product_name: item.product_name, quantity_received: Number(item.quantity_pending ?? (item.quantity_ordered - item.quantity_received)), batch_number: '', manufactured_date: '', expiry_date: '' })));
+  };
+
+  const submitReceive = async () => {
+    if (!receivePo || receiveItems.length === 0) return;
+    const ok = await run(() => purchaseOrderService.receive(receivePo.id, { items: receiveItems.map(({ product_name, ...item }) => ({ ...item, quantity_received: Number(item.quantity_received) })) }), 'Products received into the regular inventory lifecycle.');
+    if (ok) { setReceivePo(null); setReceiveItems([]); }
+  };
+
+  const openPayment = (vendor?: ResellVendorProfile, mode: 'payment' | 'refund' = 'payment') => {
+    setPaymentMode(mode);
+    setPaymentForm({ resell_vendor_id: vendor?.id || '', payment_method_id: paymentMethods[0]?.id || '', payment_date: today(), notes: '' });
+    setPaymentAllocations({});
+    setPaymentPurchaseOrders([]);
+    setPaymentModal(true);
+  };
+
+  const openViewPo = async (po: any) => {
+    setViewPo(po);
+    setViewPoLoading(true);
+    try {
+      const result = await purchaseOrderService.getById(po.id);
+      if (result.data) setViewPo(result.data);
+    } catch (error) {
+      flash('error', getError(error));
+    } finally {
+      setViewPoLoading(false);
+    }
+  };
+
+  const submitPayment = async () => {
+    const allocations = paymentPurchaseOrders
+      .map((po) => ({ purchase_order_id: Number(po.id), amount: Number(paymentAllocations[po.id] || 0) }))
+      .filter((allocation) => allocation.amount > 0);
+
+    if (!paymentForm.resell_vendor_id || !paymentForm.payment_method_id || allocations.length === 0) {
+      return flash('error', 'Choose a vendor, payment method, and enter an amount for at least one PO.');
+    }
+
+    const invalid = allocations.find((allocation) => {
+      const po = paymentPurchaseOrders.find((row) => Number(row.id) === allocation.purchase_order_id);
+      const available = Number((paymentMode === 'refund' ? po?.refund_due : po?.vendor_due) || 0);
+      return !po || allocation.amount > available + 0.001;
+    });
+    if (invalid) return flash('error', paymentMode === 'refund'
+      ? 'A PO refund cannot exceed the amount currently due back from that vendor.'
+      : 'A PO payment cannot exceed that PO’s current outstanding.');
+
+    const ok = await run(() => resellService.createPayment({
+      ...paymentForm,
+      resell_vendor_id: Number(paymentForm.resell_vendor_id),
+      payment_method_id: Number(paymentForm.payment_method_id),
+      settlement_type: paymentMode,
+      allocations,
+    }), paymentMode === 'refund'
+      ? 'Refund from vendor recorded against the selected PO amounts.'
+      : 'Vendor payment recorded against the selected PO amounts.');
+    if (ok) {
+      setPaymentModal(false);
+      setPaymentAllocations({});
+      setPaymentPurchaseOrders([]);
+      setTab('payments');
+    }
+  };
+
+  const cancelPurchaseOrder = async (po: any) => {
+    const reason = window.prompt(`Why are you cancelling ${po.po_number}?`, 'Cancelled from Resell Items panel');
+    if (reason === null) return;
+    await run(() => purchaseOrderService.cancel(po.id, reason.trim() || undefined), 'Resell purchase order cancelled.');
+  };
+
+  const cards = [
+    ['Resell Vendors', summary?.vendors || 0, Users],
+    ['Stock on Hand', summary?.stock_on_hand || 0, Box],
+    ['Net Units Sold', summary?.net_units_sold || 0, PackageCheck],
+    ['Inventory at Cost', money(summary?.stock_cost_value), Box],
+    ['Vendor Earned', money(summary?.vendor_earned), CircleDollarSign],
+    ['Paid Vendors', money(summary?.paid_amount), BadgeDollarSign],
+    ['Refunded by Vendors', money(summary?.refunded_amount), RotateCcw],
+    ['Vendor Due', money(summary?.vendor_due), CircleDollarSign],
+    ['Refund Due', money(summary?.refund_due), RotateCcw],
+    ['Net Sales', money(summary?.net_sales), BadgeDollarSign],
+  ];
+
+  return (
+    <div className="flex min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-100">
+      <Sidebar isOpen={isSidebarOpen} setIsOpen={setIsSidebarOpen} />
+      <div className="min-w-0 flex-1">
+        <Header darkMode={darkMode} setDarkMode={setDarkMode} toggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)} />
+        <main className="p-4 md:p-7">
+          {notice && <div className={`mb-5 rounded-xl border px-4 py-3 text-sm ${notice.type === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200' : 'border-red-200 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200'}`}>{notice.text}</div>}
+
+          <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div>
+              <div className="mb-2 inline-flex items-center gap-2 rounded-full bg-violet-100 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-violet-700 dark:bg-violet-950 dark:text-violet-300"><ShoppingBag className="h-4 w-4" /> Separate classification, regular lifecycle</div>
+              <h1 className="text-3xl font-bold">Resell Items</h1>
+              <p className="mt-2 max-w-3xl text-sm text-gray-600 dark:text-gray-400">Receive resell stock normally, then settle the vendor only for units actually sold. Unsold inventory stays visible at cost but does not become vendor due.</p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button onClick={() => { loadAll(); loadPurchaseOrders(); }} disabled={loading || poLoading} className="inline-flex items-center gap-2 rounded-xl border border-gray-300 bg-white px-4 py-2.5 text-sm font-medium hover:bg-gray-50 disabled:opacity-50 dark:border-gray-700 dark:bg-gray-900 dark:hover:bg-gray-800"><RefreshCw className={`h-4 w-4 ${loading || poLoading ? 'animate-spin' : ''}`} /> Refresh</button>
+              <AccessControl roles={['super-admin', 'admin']}><Link href="/resell/reports" className="inline-flex items-center gap-2 rounded-xl bg-gray-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-gray-700 dark:bg-white dark:text-gray-900"><BarChart3 className="h-4 w-4" /> Reports <ChevronRight className="h-4 w-4" /></Link></AccessControl>
+            </div>
+          </div>
+
+          <div className="mb-7 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+            {cards.map(([label, value, Icon]: any) => <div key={label} className="rounded-2xl border border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-gray-900"><Icon className="mb-3 h-5 w-5 text-violet-600" /><div className="text-2xl font-bold">{value}</div><div className="mt-1 text-xs text-gray-500">{label}</div></div>)}
+          </div>
+
+          <div className="mb-5 flex flex-wrap gap-2 border-b border-gray-200 dark:border-gray-800">
+            {([
+              ['vendors', 'Vendors', Users], ['products', 'Products', ShoppingBag], ['purchase-orders', 'Purchase Orders', Truck], ['payments', 'Payments', CircleDollarSign],
+            ] as const).map(([key, label, Icon]) => <button key={key} onClick={() => setTab(key)} className={`inline-flex items-center gap-2 border-b-2 px-4 py-3 text-sm font-semibold ${tab === key ? 'border-violet-600 text-violet-700 dark:text-violet-300' : 'border-transparent text-gray-500 hover:text-gray-900 dark:hover:text-white'}`}><Icon className="h-4 w-4" /> {label}</button>)}
+          </div>
+
+          {loading ? <div className="flex h-64 items-center justify-center"><Loader2 className="h-8 w-8 animate-spin text-violet-600" /></div> : (
+            <>
+              {tab === 'vendors' && <section>
+                <div className="mb-4 flex justify-end"><AccessControl roles={['super-admin', 'admin']}><button onClick={() => setVendorModal(true)} className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-violet-700"><Plus className="h-4 w-4" /> Add Resell Vendor</button></AccessControl></div>
+                <div className="overflow-hidden rounded-2xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900"><div className="overflow-x-auto"><table className="min-w-full text-sm"><thead className="bg-gray-50 text-left text-xs uppercase text-gray-500 dark:bg-gray-800"><tr><th className="px-5 py-3">Vendor</th><th className="px-5 py-3 text-right">Sold Qty</th><th className="px-5 py-3 text-right">In Stock</th><th className="px-5 py-3 text-right">Inventory Cost</th><th className="px-5 py-3 text-right">Vendor Earned</th><th className="px-5 py-3 text-right">Paid</th><th className="px-5 py-3 text-right">Refunded</th><th className="px-5 py-3 text-right">Due</th><th className="px-5 py-3 text-right">Refund Due</th><th className="px-5 py-3"></th></tr></thead><tbody className="divide-y divide-gray-100 dark:divide-gray-800">{vendors.map((row) => <tr key={row.id}><td className="px-5 py-4"><div className="font-semibold">{row.vendor?.name}</div><div className="text-xs text-gray-500">{row.product_count} products · {row.vendor?.contact_person || row.vendor?.phone || 'No contact'}</div></td><td className="px-5 py-4 text-right font-medium">{row.net_units_sold}</td><td className="px-5 py-4 text-right">{row.stock_on_hand}</td><td className="px-5 py-4 text-right">{money(row.stock_cost_value)}</td><td className="px-5 py-4 text-right font-semibold">{money(row.vendor_earned)}</td><td className="px-5 py-4 text-right text-emerald-600">{money(row.paid_amount)}</td><td className="px-5 py-4 text-right text-blue-600">{money(row.refunded_amount)}</td><td className="px-5 py-4 text-right font-semibold text-amber-600">{money(row.vendor_due)}</td><td className="px-5 py-4 text-right font-semibold text-blue-600">{money(row.refund_due)}</td><td className="px-5 py-4"><div className="flex justify-end gap-2">{Number(row.vendor_due) > 0 && <button onClick={() => openPayment(row, 'payment')} className="rounded-lg border px-3 py-1.5 text-xs font-medium hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800">Pay</button>}{Number(row.refund_due) > 0 && <button onClick={() => openPayment(row, 'refund')} className="rounded-lg border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-50 dark:border-blue-900 dark:text-blue-300 dark:hover:bg-blue-950">Refund From Vendor</button>}{Number(row.vendor_due) <= 0 && Number(row.refund_due) <= 0 && <span className="px-2 py-1.5 text-xs text-gray-500">Settled</span>}<AccessControl roles={['super-admin', 'admin']}><button onClick={() => window.confirm('Remove this resell tag? This is blocked while products, open POs, or any resell settlement remains.') && run(() => resellService.unmarkVendor(row.id), 'Resell vendor tag removed.')} className="rounded-lg p-2 text-red-600 hover:bg-red-50 dark:hover:bg-red-950"><Trash2 className="h-4 w-4" /></button></AccessControl></div></td></tr>)}{vendors.length === 0 && <tr><td colSpan={10} className="px-5 py-14 text-center text-gray-500">No resell vendors yet.</td></tr>}</tbody></table></div></div>
+              </section>}
+
+              {tab === 'products' && <section>
+                <div className="mb-4 flex justify-end"><AccessControl roles={['super-admin', 'admin']}><button onClick={() => setProductModal(true)} className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-violet-700"><Plus className="h-4 w-4" /> Mark Resell Product</button></AccessControl></div>
+                <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{products.map((row) => <article key={row.id} className="rounded-2xl border border-gray-200 bg-white p-5 dark:border-gray-800 dark:bg-gray-900"><div className="flex items-start justify-between gap-3"><div><h3 className="font-semibold">{row.product?.name}</h3><div className="mt-1 text-xs text-gray-500">SKU {row.product?.sku || '—'} · {row.resell_vendor?.vendor?.name}</div></div><Pill tone="blue">{row.stock_on_hand} left</Pill></div><div className="mt-5 grid grid-cols-2 gap-3 border-t pt-4 text-sm dark:border-gray-800"><div><div className="text-xs text-gray-500">Sold</div><div className="font-semibold">{row.net_units_sold}</div></div><div><div className="text-xs text-gray-500">Received</div><div className="font-semibold">{row.received_quantity}</div></div><div><div className="text-xs text-gray-500">Inventory Cost</div><div className="font-semibold">{money(row.stock_cost_value)}</div></div><div><div className="text-xs text-gray-500">Vendor Earned</div><div className="font-semibold">{money(row.vendor_earned)}</div></div></div><div className="mt-4 flex justify-end"><AccessControl roles={['super-admin', 'admin']}><button title="Remove resell tag" onClick={() => window.confirm('Remove this tag? This is blocked while stock or open PO items remain.') && run(() => resellService.unmarkProduct(row.id), 'Resell product tag removed.')} className="rounded-lg p-2 text-red-600 hover:bg-red-50 dark:hover:bg-red-950"><Trash2 className="h-4 w-4" /></button></AccessControl></div></article>)}{products.length === 0 && <div className="col-span-full rounded-2xl border border-dashed p-14 text-center text-gray-500 dark:border-gray-700">No resell products yet.</div>}</div>
+              </section>}
+
+              {tab === 'purchase-orders' && <section>
+                <div className="mb-4 flex flex-col gap-3 xl:flex-row xl:items-end xl:justify-between">
+                  <div className="grid flex-1 gap-3 sm:grid-cols-3">
+                    <label className="text-sm"><span className="mb-1 block font-medium">Search PO</span><div className="relative"><Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" /><input value={poSearchInput} onChange={(e) => setPoSearchInput(e.target.value)} placeholder="PO number" className="w-full rounded-xl border bg-white py-2.5 pl-9 pr-3 dark:border-gray-700 dark:bg-gray-900" /></div></label>
+                    <label className="text-sm"><span className="mb-1 block font-medium">From Date</span><input type="date" value={poFilters.from_date} onChange={(e) => setPoFilters((current) => ({ ...current, from_date: e.target.value, page: 1 }))} className="w-full rounded-xl border bg-white px-3 py-2.5 dark:border-gray-700 dark:bg-gray-900" /></label>
+                    <label className="text-sm"><span className="mb-1 block font-medium">To Date</span><input type="date" value={poFilters.to_date} onChange={(e) => setPoFilters((current) => ({ ...current, to_date: e.target.value, page: 1 }))} className="w-full rounded-xl border bg-white px-3 py-2.5 dark:border-gray-700 dark:bg-gray-900" /></label>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={() => { setPoSearchInput(''); setPoFilters({ search: '', from_date: '', to_date: '', page: 1, per_page: 25 }); }} className="rounded-xl border border-gray-300 bg-white px-4 py-2.5 text-sm font-medium hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-900 dark:hover:bg-gray-800">Clear</button>
+                    <button onClick={() => setPoModal(true)} className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-violet-700"><FilePlus2 className="h-4 w-4" /> Create Resell PO</button>
+                  </div>
+                </div>
+                <div className="overflow-hidden rounded-2xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
+                  <div className="overflow-x-auto">
+                    <table className="min-w-full text-sm">
+                      <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500 dark:bg-gray-800"><tr><th className="px-4 py-3">PO</th><th className="px-4 py-3">Vendor</th><th className="px-4 py-3">Status</th><th className="px-4 py-3 text-right">Received</th><th className="px-4 py-3 text-right">Sold</th><th className="px-4 py-3 text-right">Return</th><th className="px-4 py-3 text-right">In Stock</th><th className="px-4 py-3 text-right">Total PO Value</th><th className="px-4 py-3 text-right">COGS</th><th className="px-4 py-3 text-right">Paid</th><th className="px-4 py-3 text-right">Refunded</th><th className="px-4 py-3 text-right">Outstanding</th><th className="px-4 py-3 text-right">Refund Due</th><th className="px-4 py-3">Payment</th><th className="px-4 py-3"></th></tr></thead>
+                      <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+                        {poLoading ? <tr><td colSpan={15} className="px-5 py-14 text-center text-gray-500"><Loader2 className="mx-auto mb-2 h-5 w-5 animate-spin" />Loading resell purchase orders...</td></tr> : purchaseOrders.map((po) => {
+                          const paymentStatus = String(po.resell_payment_status || 'not_due');
+                          const paymentTone = paymentStatus === 'paid' ? 'green' : paymentStatus === 'partially_paid' ? 'amber' : paymentStatus === 'unpaid' ? 'red' : paymentStatus === 'refund_due' ? 'blue' : 'gray';
+                          return <tr key={po.id}>
+                            <td className="px-4 py-4"><div className="flex items-center gap-2"><div><div className="font-semibold">{po.po_number}</div><div className="text-xs text-gray-500">{po.order_date} · {po.store?.name || '—'}</div></div><button type="button" title="View purchase order" onClick={() => openViewPo(po)} className="rounded-lg p-1.5 text-violet-600 hover:bg-violet-50 dark:hover:bg-violet-950"><Eye className="h-4 w-4" /></button></div></td>
+                            <td className="px-4 py-4">{po.vendor?.name}</td>
+                            <td className="px-4 py-4"><Pill tone={po.status === 'received' ? 'green' : po.status === 'cancelled' ? 'red' : po.status === 'approved' ? 'blue' : 'amber'}>{String(po.status).replaceAll('_', ' ')}</Pill></td>
+                            <td className="px-4 py-4 text-right">{po.received_quantity || 0}</td>
+                            <td className="px-4 py-4 text-right font-semibold">{po.net_units_sold || 0}</td>
+                            <td className="px-4 py-4 text-right text-red-600">{po.return_count || 0}</td>
+                            <td className="px-4 py-4 text-right">{po.stock_on_hand || 0}</td>
+                            <td className="px-4 py-4 text-right">{money(po.consignment_value ?? po.total_amount)}</td>
+                            <td className="px-4 py-4 text-right font-semibold">{money(po.sold_cost)}</td>
+                            <td className="px-4 py-4 text-right text-emerald-600">{money(po.resell_paid_amount)}</td>
+                            <td className="px-4 py-4 text-right text-blue-600">{money(po.resell_refunded_amount)}</td>
+                            <td className="px-4 py-4 text-right font-semibold text-amber-600">{money(po.vendor_due)}</td>
+                            <td className="px-4 py-4 text-right font-semibold text-blue-600">{money(po.refund_due)}</td>
+                            <td className="px-4 py-4"><Pill tone={paymentTone}>{paymentStatus.replaceAll('_', ' ')}</Pill></td>
+                            <td className="px-4 py-4"><div className="flex justify-end gap-2">{po.status === 'draft' && <button disabled={working} onClick={() => run(() => purchaseOrderService.approve(po.id), 'Purchase order approved.')} className="inline-flex items-center gap-1 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white"><Check className="h-3.5 w-3.5" /> Approve</button>}{['approved', 'partially_received'].includes(po.status) && <button onClick={() => openReceive(po)} className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white"><PackageCheck className="h-3.5 w-3.5" /> Receive</button>}{['draft', 'approved'].includes(po.status) && <button disabled={working} onClick={() => cancelPurchaseOrder(po)} className="inline-flex items-center gap-1 rounded-lg border border-red-200 px-3 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50 dark:border-red-900 dark:hover:bg-red-950"><X className="h-3.5 w-3.5" /> Cancel</button>}</div></td>
+                          </tr>;
+                        })}
+                        {!poLoading && purchaseOrders.length === 0 && <tr><td colSpan={15} className="px-5 py-14 text-center text-gray-500">No resell purchase orders match these filters.</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="flex flex-col gap-3 border-t border-gray-200 px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between dark:border-gray-800">
+                    <div className="text-gray-500">{poPagination.total > 0 ? `Showing ${poPagination.from}–${poPagination.to} of ${poPagination.total}` : '0 purchase orders'}</div>
+                    <div className="flex items-center gap-2"><button disabled={poLoading || poPagination.current_page <= 1} onClick={() => setPoFilters((current) => ({ ...current, page: Math.max(1, current.page - 1) }))} className="inline-flex items-center gap-1 rounded-lg border px-3 py-1.5 disabled:opacity-40 dark:border-gray-700"><ChevronLeft className="h-4 w-4" /> Previous</button><span className="px-2 text-gray-600 dark:text-gray-300">Page {poPagination.current_page} of {poPagination.last_page}</span><button disabled={poLoading || poPagination.current_page >= poPagination.last_page} onClick={() => setPoFilters((current) => ({ ...current, page: Math.min(poPagination.last_page, current.page + 1) }))} className="inline-flex items-center gap-1 rounded-lg border px-3 py-1.5 disabled:opacity-40 dark:border-gray-700">Next <ChevronRight className="h-4 w-4" /></button></div>
+                  </div>
+                </div>
+              </section>}
+
+              {tab === 'payments' && <section>
+                <div className="mb-4 flex justify-end"><button onClick={() => openPayment()} className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-violet-700"><CircleDollarSign className="h-4 w-4" /> Record Payment / Refund</button></div>
+                <div className="overflow-hidden rounded-2xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900"><div className="overflow-x-auto"><table className="min-w-full text-sm"><thead className="bg-gray-50 text-left text-xs uppercase text-gray-500 dark:bg-gray-800"><tr><th className="px-5 py-3">Payment</th><th className="px-5 py-3">Vendor</th><th className="px-5 py-3">Date</th><th className="px-5 py-3">Method</th><th className="px-5 py-3">Applied POs</th><th className="px-5 py-3 text-right">Amount</th><th className="px-5 py-3">Status</th></tr></thead><tbody className="divide-y divide-gray-100 dark:divide-gray-800">{payments.map((payment) => <tr key={payment.id}><td className="px-5 py-4 font-semibold">{payment.payment_number}</td><td className="px-5 py-4">{payment.vendor?.name}</td><td className="px-5 py-4">{payment.payment_date}</td><td className="px-5 py-4">{payment.payment_method?.name || '—'}</td><td className="px-5 py-4"><div className="max-w-sm text-xs text-gray-600 dark:text-gray-300">{Array.isArray(payment.payment_items) && payment.payment_items.length > 0 ? payment.payment_items.map((item: any) => `${item.purchase_order?.po_number || `PO #${item.purchase_order_id}`}: ${money(item.allocated_amount)}`).join(' · ') : 'Legacy vendor-level payment'}</div></td><td className={`px-5 py-4 text-right font-semibold ${payment.payment_type === 'refund' && payment.metadata?.refund_from_vendor ? 'text-blue-600' : 'text-emerald-600'}`}>{money(payment.amount)}</td><td className="px-5 py-4">{(() => { const settlement = getResellPaymentSettlement(payment); return <Pill tone={settlement.tone}>{settlement.label}</Pill>; })()}</td></tr>)}{payments.length === 0 && <tr><td colSpan={7} className="px-5 py-14 text-center text-gray-500">No resell vendor payments yet.</td></tr>}</tbody></table></div></div>
+              </section>}
+            </>
+          )}
+        </main>
+      </div>
+
+      <Modal open={vendorModal} title="Add Resell Vendor" onClose={() => setVendorModal(false)}>
+        <div className="space-y-4"><div className="relative"><Search className="absolute left-3 top-3 h-4 w-4 text-gray-400" /><input value={vendorSearch} onChange={(e) => setVendorSearch(e.target.value)} placeholder="Search existing vendors" className="w-full rounded-xl border border-gray-300 bg-transparent py-2.5 pl-10 pr-4 dark:border-gray-700" /></div><textarea value={vendorNotes} onChange={(e) => setVendorNotes(e.target.value)} placeholder="Optional internal note" className="w-full rounded-xl border border-gray-300 bg-transparent p-3 dark:border-gray-700" rows={2} /><div className="max-h-96 space-y-2 overflow-y-auto">{vendorCandidates.map((vendor) => <button key={vendor.id} disabled={working} onClick={() => markVendor(vendor)} className="flex w-full items-center justify-between rounded-xl border border-gray-200 p-4 text-left hover:border-violet-400 hover:bg-violet-50 dark:border-gray-700 dark:hover:bg-violet-950"><div><div className="font-semibold">{vendor.name}</div><div className="text-xs text-gray-500">{vendor.contact_person || vendor.phone || vendor.email || 'No contact information'}</div></div><Plus className="h-5 w-5 text-violet-600" /></button>)}{vendorCandidates.length === 0 && <div className="py-10 text-center text-sm text-gray-500">No eligible regular vendors found.</div>}</div></div>
+      </Modal>
+
+      <Modal open={productModal} title="Mark Existing Product as Resell" onClose={() => setProductModal(false)} wide>
+        <div className="mb-5 grid gap-4 md:grid-cols-[280px_1fr]"><select value={productVendorId} onChange={(e) => setProductVendorId(e.target.value ? Number(e.target.value) : '')} className="rounded-xl border border-gray-300 bg-transparent px-3 py-2.5 dark:border-gray-700"><option value="">Select resell vendor</option>{activeVendors.map((vendor) => <option key={vendor.id} value={vendor.id}>{vendor.vendor?.name}</option>)}</select><div className="relative"><Search className="absolute left-3 top-3 h-4 w-4 text-gray-400" /><input value={productSearch} onChange={(e) => setProductSearch(e.target.value)} placeholder="Search exactly like Social Commerce: name, SKU, Bangla, variations…" className="w-full rounded-xl border border-gray-300 bg-transparent py-2.5 pl-10 pr-4 dark:border-gray-700" /></div></div>
+        {productSearching ? <div className="flex h-48 items-center justify-center"><Loader2 className="h-7 w-7 animate-spin" /></div> : <div className="grid gap-3 md:grid-cols-2">{productResults.map((product) => { const already = products.some((tag) => tag.product_id === product.id && tag.is_active); return <div key={product.id} className="flex items-center justify-between rounded-xl border border-gray-200 p-4 dark:border-gray-700"><div><div className="font-semibold">{product.name}</div><div className="text-xs text-gray-500">SKU {product.sku} · Stock {product.stock_quantity ?? 0}</div></div><button disabled={already || working || !productVendorId} onClick={() => markProduct(product)} className="rounded-lg bg-violet-600 px-3 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:bg-gray-400">{already ? 'Already tagged' : 'Mark resell'}</button></div>; })}{productSearch && productResults.length === 0 && <div className="col-span-full py-12 text-center text-gray-500">No products found.</div>}</div>}
+      </Modal>
+
+      <Modal open={poModal} title="Create Resell Purchase Order" onClose={() => setPoModal(false)} wide>
+        <div className="space-y-6">
+          <div className="grid gap-4 md:grid-cols-4"><label className="text-sm"><span className="mb-1 block font-medium">Resell Vendor</span><select value={poForm.resell_vendor_id} onChange={(e) => setPoForm({ ...poForm, resell_vendor_id: e.target.value, items: [] })} className="w-full rounded-xl border bg-transparent px-3 py-2.5 dark:border-gray-700"><option value="">Select vendor</option>{activeVendors.map((v) => <option key={v.id} value={v.id}>{v.vendor?.name}</option>)}</select></label><label className="text-sm"><span className="mb-1 block font-medium">Receiving Store</span><select value={poForm.store_id} onChange={(e) => setPoForm({ ...poForm, store_id: e.target.value })} className="w-full rounded-xl border bg-transparent px-3 py-2.5 dark:border-gray-700"><option value="">Select store</option>{stores.map((s) => <option key={s.id} value={s.id}>{s.name} — {s.is_warehouse ? 'Warehouse' : 'Store'}</option>)}</select></label><label className="text-sm"><span className="mb-1 block font-medium">Order Date</span><input type="date" value={poForm.order_date} onChange={(e) => setPoForm({ ...poForm, order_date: e.target.value })} className="w-full rounded-xl border bg-transparent px-3 py-2.5 dark:border-gray-700" /></label><label className="text-sm"><span className="mb-1 block font-medium">Expected Delivery</span><input type="date" value={poForm.expected_delivery_date} onChange={(e) => setPoForm({ ...poForm, expected_delivery_date: e.target.value })} className="w-full rounded-xl border bg-transparent px-3 py-2.5 dark:border-gray-700" /></label></div>
+          <div className="grid gap-5 lg:grid-cols-[340px_1fr]"><div><h3 className="mb-3 text-sm font-semibold">Vendor’s Tagged Products</h3><div className="max-h-[420px] space-y-2 overflow-y-auto rounded-xl border p-2 dark:border-gray-700">{selectedPoVendorProducts.map((tag) => <button key={tag.id} onClick={() => addPoItem(tag)} className="flex w-full items-center justify-between rounded-lg p-3 text-left hover:bg-gray-100 dark:hover:bg-gray-800"><div><div className="text-sm font-medium">{tag.product?.name}</div><div className="text-xs text-gray-500">{tag.product?.sku}</div></div><Plus className="h-4 w-4" /></button>)}{!poForm.resell_vendor_id && <div className="p-8 text-center text-sm text-gray-500">Choose a vendor first.</div>}{poForm.resell_vendor_id && selectedPoVendorProducts.length === 0 && <div className="p-8 text-center text-sm text-gray-500">This vendor has no tagged products.</div>}</div></div><div><h3 className="mb-3 text-sm font-semibold">PO Items</h3><div className="overflow-x-auto rounded-xl border dark:border-gray-700"><table className="min-w-full text-sm"><thead className="bg-gray-50 text-xs text-gray-500 dark:bg-gray-800"><tr><th className="px-3 py-2 text-left">Product</th><th className="px-3 py-2">Qty</th><th className="px-3 py-2">Unit Cost</th><th className="px-3 py-2">Sell Price</th><th></th></tr></thead><tbody>{poForm.items.map((item: any, index: number) => <tr key={item.product_id} className="border-t dark:border-gray-800"><td className="px-3 py-3"><div className="font-medium">{item.product_name}</div><div className="text-xs text-gray-500">{item.sku}</div></td><td className="px-3 py-3"><input type="number" min="1" value={item.quantity_ordered} onChange={(e) => updatePoItem(index, 'quantity_ordered', e.target.value)} className="w-20 rounded-lg border bg-transparent px-2 py-1.5 dark:border-gray-700" /></td><td className="px-3 py-3"><input type="number" min="0" step="0.01" value={item.unit_cost} onChange={(e) => updatePoItem(index, 'unit_cost', e.target.value)} className="w-28 rounded-lg border bg-transparent px-2 py-1.5 dark:border-gray-700" /></td><td className="px-3 py-3"><input type="number" min="0" step="0.01" value={item.unit_sell_price} onChange={(e) => updatePoItem(index, 'unit_sell_price', e.target.value)} className="w-28 rounded-lg border bg-transparent px-2 py-1.5 dark:border-gray-700" /></td><td className="px-3 py-3"><button onClick={() => setPoForm((form: any) => ({ ...form, items: form.items.filter((_: any, i: number) => i !== index) }))} className="text-red-600"><Trash2 className="h-4 w-4" /></button></td></tr>)}{poForm.items.length === 0 && <tr><td colSpan={5} className="p-10 text-center text-gray-500">Add tagged products from the left.</td></tr>}</tbody></table></div></div></div>
+          <div className="grid gap-4 md:grid-cols-4">{['tax_amount', 'discount_amount', 'shipping_cost', 'other_charges'].map((field) => <label key={field} className="text-sm"><span className="mb-1 block font-medium capitalize">{field.replaceAll('_', ' ')}</span><input type="number" min="0" step="0.01" value={poForm[field]} onChange={(e) => setPoForm({ ...poForm, [field]: Number(e.target.value) })} className="w-full rounded-xl border bg-transparent px-3 py-2.5 dark:border-gray-700" /></label>)}</div><textarea value={poForm.notes} onChange={(e) => setPoForm({ ...poForm, notes: e.target.value })} placeholder="PO notes" rows={2} className="w-full rounded-xl border bg-transparent p-3 dark:border-gray-700" /><div className="flex justify-end"><button disabled={working} onClick={submitPo} className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-5 py-2.5 font-semibold text-white disabled:opacity-50">{working && <Loader2 className="h-4 w-4 animate-spin" />} Create PO</button></div>
+        </div>
+      </Modal>
+
+      <Modal open={!!viewPo} title="Purchase Order Details" onClose={() => setViewPo(null)} wide>
+        {viewPo && <div className="space-y-5">
+          {viewPoLoading && <div className="flex items-center gap-2 text-sm text-gray-500"><Loader2 className="h-4 w-4 animate-spin" />Loading latest PO details...</div>}
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <div><div className="text-xs text-gray-500">PO Number</div><div className="font-semibold">{viewPo.po_number}</div></div>
+            <div><div className="text-xs text-gray-500">Status</div><div className="mt-1"><Pill tone={viewPo.status === 'received' ? 'green' : viewPo.status === 'cancelled' ? 'red' : viewPo.status === 'approved' ? 'blue' : 'amber'}>{String(viewPo.status || '').replaceAll('_', ' ')}</Pill></div></div>
+            <div><div className="text-xs text-gray-500">Order Date</div><div className="font-semibold">{String(viewPo.order_date || '—').slice(0, 10)}</div></div>
+            <div><div className="text-xs text-gray-500">Vendor</div><div className="font-semibold">{viewPo.vendor?.name || 'N/A'}</div></div>
+            <div><div className="text-xs text-gray-500">Receiving Store</div><div className="font-semibold">{viewPo.store?.name || 'N/A'}</div></div>
+            <div><div className="text-xs text-gray-500">Total Items (Qty)</div><div className="font-semibold">{(viewPo.items || []).reduce((sum: number, item: any) => sum + Number(item.quantity_ordered || 0), 0)}</div></div>
+          </div>
+          <div className="border-t pt-4 dark:border-gray-700"><div className="text-sm font-semibold">Notes</div><div className="mt-1 whitespace-pre-wrap text-sm text-gray-600 dark:text-gray-300">{viewPo.notes || '—'}</div>{viewPo.terms_and_conditions && <><div className="mt-4 text-sm font-semibold">Terms &amp; Conditions</div><div className="mt-1 whitespace-pre-wrap text-sm text-gray-600 dark:text-gray-300">{viewPo.terms_and_conditions}</div></>}</div>
+          <div className="overflow-hidden rounded-xl border dark:border-gray-700"><div className="border-b bg-gray-50 px-4 py-3 font-semibold dark:border-gray-700 dark:bg-gray-800">Items</div><div className="overflow-x-auto"><table className="min-w-full text-sm"><thead className="bg-gray-50/70 text-xs text-gray-500 dark:bg-gray-800/70"><tr><th className="px-4 py-3 text-left">Product</th><th className="px-4 py-3 text-right">Ordered</th><th className="px-4 py-3 text-right">Received</th><th className="px-4 py-3 text-right">Cost / Unit</th><th className="px-4 py-3 text-right">Sell Price</th></tr></thead><tbody className="divide-y dark:divide-gray-800">{(viewPo.items || []).map((item: any, index: number) => <tr key={item.id || index}><td className="px-4 py-3"><div className="font-medium">{item.product_name || item.product?.name || 'Product'}</div><div className="text-xs text-gray-500">{item.product_sku || item.product?.sku || ''}</div></td><td className="px-4 py-3 text-right">{item.quantity_ordered || 0}</td><td className="px-4 py-3 text-right">{item.quantity_received || 0}</td><td className="px-4 py-3 text-right">{money(item.unit_cost)}</td><td className="px-4 py-3 text-right">{money(item.unit_sell_price)}</td></tr>)}</tbody></table></div></div>
+          <div className="ml-auto max-w-sm space-y-2 border-t pt-4 text-sm dark:border-gray-700"><div className="flex justify-between"><span className="text-gray-500">Subtotal</span><span>{money(viewPo.subtotal)}</span></div><div className="flex justify-between"><span className="text-gray-500">Tax</span><span>{money(viewPo.tax_amount)}</span></div><div className="flex justify-between"><span className="text-gray-500">Discount</span><span>-{money(viewPo.discount_amount)}</span></div><div className="flex justify-between"><span className="text-gray-500">Shipping</span><span>{money(viewPo.shipping_cost)}</span></div><div className="flex justify-between border-t pt-2 text-base font-bold dark:border-gray-700"><span>Total PO Value</span><span>{money(viewPo.total_amount)}</span></div></div>
+        </div>}
+      </Modal>
+
+      <Modal open={!!receivePo} title={`Receive ${receivePo?.po_number || 'Purchase Order'}`} onClose={() => setReceivePo(null)} wide>
+        <div className="space-y-4">{receiveItems.map((item, index) => <div key={item.item_id} className="grid gap-3 rounded-xl border p-4 md:grid-cols-5 dark:border-gray-700"><div className="md:col-span-1"><div className="text-xs text-gray-500">Product</div><div className="font-medium">{item.product_name}</div></div><label className="text-sm"><span className="mb-1 block text-xs text-gray-500">Quantity</span><input type="number" min="1" value={item.quantity_received} onChange={(e) => setReceiveItems((rows) => rows.map((row, i) => i === index ? { ...row, quantity_received: e.target.value } : row))} className="w-full rounded-lg border bg-transparent px-2 py-2 dark:border-gray-700" /></label><label className="text-sm"><span className="mb-1 block text-xs text-gray-500">Batch Number</span><input value={item.batch_number} onChange={(e) => setReceiveItems((rows) => rows.map((row, i) => i === index ? { ...row, batch_number: e.target.value } : row))} className="w-full rounded-lg border bg-transparent px-2 py-2 dark:border-gray-700" /></label><label className="text-sm"><span className="mb-1 block text-xs text-gray-500">Manufactured</span><input type="date" value={item.manufactured_date} onChange={(e) => setReceiveItems((rows) => rows.map((row, i) => i === index ? { ...row, manufactured_date: e.target.value } : row))} className="w-full rounded-lg border bg-transparent px-2 py-2 dark:border-gray-700" /></label><label className="text-sm"><span className="mb-1 block text-xs text-gray-500">Expiry</span><input type="date" value={item.expiry_date} onChange={(e) => setReceiveItems((rows) => rows.map((row, i) => i === index ? { ...row, expiry_date: e.target.value } : row))} className="w-full rounded-lg border bg-transparent px-2 py-2 dark:border-gray-700" /></label></div>)}<div className="flex justify-end"><button disabled={working} onClick={submitReceive} className="rounded-xl bg-emerald-600 px-5 py-2.5 font-semibold text-white disabled:opacity-50">Receive into Inventory</button></div></div>
+      </Modal>
+
+      <Modal open={paymentModal} title="Record Resell Vendor Settlement" onClose={() => setPaymentModal(false)} wide>
+        <div className="space-y-5">
+          <div className="inline-flex rounded-xl border border-gray-200 bg-gray-50 p-1 dark:border-gray-700 dark:bg-gray-800">
+            <button type="button" onClick={() => { setPaymentMode('payment'); setPaymentAllocations({}); }} className={`rounded-lg px-4 py-2 text-sm font-semibold ${paymentMode === 'payment' ? 'bg-white text-emerald-700 shadow-sm dark:bg-gray-900 dark:text-emerald-300' : 'text-gray-500'}`}>Pay Vendor</button>
+            <button type="button" onClick={() => { setPaymentMode('refund'); setPaymentAllocations({}); }} className={`rounded-lg px-4 py-2 text-sm font-semibold ${paymentMode === 'refund' ? 'bg-white text-blue-700 shadow-sm dark:bg-gray-900 dark:text-blue-300' : 'text-gray-500'}`}>Refund From Vendor</button>
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-3">
+            <label className="text-sm"><span className="mb-1 block font-medium">Vendor</span><select value={paymentForm.resell_vendor_id} onChange={(e) => setPaymentForm({ ...paymentForm, resell_vendor_id: e.target.value })} className="w-full rounded-xl border bg-transparent px-3 py-2.5 dark:border-gray-700"><option value="">Select vendor</option>{activeVendors.map((v) => <option key={v.id} value={v.id}>{v.vendor?.name}</option>)}</select></label>
+            <label className="text-sm"><span className="mb-1 block font-medium">Payment Method</span><select value={paymentForm.payment_method_id} onChange={(e) => setPaymentForm({ ...paymentForm, payment_method_id: e.target.value })} className="w-full rounded-xl border bg-transparent px-3 py-2.5 dark:border-gray-700"><option value="">Select method</option>{paymentMethods.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}</select></label>
+            <label className="text-sm"><span className="mb-1 block font-medium">{paymentMode === 'refund' ? 'Refund Date' : 'Payment Date'}</span><input type="date" value={paymentForm.payment_date} onChange={(e) => setPaymentForm({ ...paymentForm, payment_date: e.target.value })} className="w-full rounded-xl border bg-transparent px-3 py-2.5 dark:border-gray-700" /></label>
+          </div>
+
+          {selectedPaymentVendor ? <div className={`grid gap-3 rounded-xl border p-4 sm:grid-cols-2 lg:grid-cols-6 ${paymentMode === 'refund' ? 'border-blue-200 bg-blue-50 dark:border-blue-900 dark:bg-blue-950/30' : 'border-emerald-200 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950/30'}`}>
+            <div><div className="text-xs text-gray-500">Vendor Earned</div><div className="text-lg font-bold">{money(selectedPaymentVendor.vendor_earned)}</div></div>
+            <div><div className="text-xs text-gray-500">Paid</div><div className="text-lg font-bold text-emerald-600">{money(selectedPaymentVendor.paid_amount)}</div></div>
+            <div><div className="text-xs text-gray-500">Refunded</div><div className="text-lg font-bold text-blue-600">{money(selectedPaymentVendor.refunded_amount)}</div></div>
+            <div><div className="text-xs text-gray-500">Net Paid</div><div className="text-lg font-bold">{money(selectedPaymentVendor.net_paid_amount)}</div></div>
+            <div><div className="text-xs text-gray-500">Vendor Due</div><div className="text-lg font-bold text-amber-600">{money(selectedPaymentVendor.vendor_due)}</div></div>
+            <div><div className="text-xs text-gray-500">Refund Due</div><div className="text-lg font-bold text-blue-600">{money(selectedPaymentVendor.refund_due)}</div></div>
+          </div> : <div className="rounded-xl border border-dashed p-8 text-center text-sm text-gray-500 dark:border-gray-700">Choose a vendor to see the sold-cost settlement.</div>}
+
+          {selectedPaymentVendor && <div className="overflow-hidden rounded-xl border border-gray-200 dark:border-gray-700">
+            <div className="border-b bg-gray-50 px-4 py-3 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:border-gray-700 dark:bg-gray-800">{paymentMode === 'refund' ? 'Enter the refund received from the vendor against each PO' : 'Enter the amount being paid against each PO'}</div>
+            <div className="overflow-x-auto"><table className="min-w-full text-sm"><thead className="bg-gray-50/70 text-xs text-gray-500 dark:bg-gray-800/70"><tr><th className="px-4 py-3 text-left">PO</th><th className="px-4 py-3 text-right">COGS</th><th className="px-4 py-3 text-right">Paid</th><th className="px-4 py-3 text-right">Refunded</th><th className="px-4 py-3 text-right">{paymentMode === 'refund' ? 'Refund Due' : 'Outstanding'}</th><th className="px-4 py-3 text-right">{paymentMode === 'refund' ? 'Refund Now' : 'Paying Now'}</th></tr></thead>
+              <tbody className="divide-y dark:divide-gray-800">{paymentPoLoading ? <tr><td colSpan={6} className="p-8 text-center text-gray-500"><Loader2 className="mx-auto mb-2 h-5 w-5 animate-spin" />Loading settlement POs...</td></tr> : paymentPurchaseOrders.map((po) => {
+                const available = Number((paymentMode === 'refund' ? po.refund_due : po.vendor_due) || 0);
+                return <tr key={po.id}><td className="px-4 py-3"><div className="font-semibold">{po.po_number}</div><div className="text-xs text-gray-500">{po.order_date}</div></td><td className="px-4 py-3 text-right">{money(po.sold_cost)}</td><td className="px-4 py-3 text-right text-emerald-600">{money(po.resell_paid_amount)}</td><td className="px-4 py-3 text-right text-blue-600">{money(po.resell_refunded_amount)}</td><td className={`px-4 py-3 text-right font-semibold ${paymentMode === 'refund' ? 'text-blue-600' : 'text-amber-600'}`}>{money(available)}</td><td className="px-4 py-3 text-right"><input type="number" min="0" max={available} step="0.01" value={paymentAllocations[po.id] ?? ''} onChange={(e) => setPaymentAllocations((current) => ({ ...current, [po.id]: e.target.value }))} className="w-32 rounded-lg border bg-transparent px-2 py-1.5 text-right font-semibold dark:border-gray-700" /></td></tr>;
+              })}{!paymentPoLoading && paymentPurchaseOrders.length === 0 && <tr><td colSpan={6} className="p-8 text-center text-gray-500">{paymentMode === 'refund' ? 'No PO currently has a refund due from this vendor.' : 'No PO liability is currently due for this vendor.'}</td></tr>}</tbody></table></div>
+            <div className="flex items-center justify-between border-t bg-gray-50 px-4 py-3 dark:border-gray-700 dark:bg-gray-800"><span className="font-semibold">{paymentMode === 'refund' ? 'Total refund being received' : 'Total being paid'}</span><span className={`text-lg font-bold ${paymentMode === 'refund' ? 'text-blue-600' : 'text-emerald-600'}`}>{money(paymentTotal)}</span></div>
+          </div>}
+
+          <p className="text-sm text-gray-500">{paymentMode === 'refund' ? `Refunds are available only when a PO's net historical payment exceeds its current COGS after returns. Each refund stays attached to the PO entered here.` : 'Only current sold resell COGS is payable. Each amount is saved against the PO you enter it for; there is no automatic FIFO allocation.'}</p>
+          <textarea value={paymentForm.notes} onChange={(e) => setPaymentForm({ ...paymentForm, notes: e.target.value })} placeholder={paymentMode === 'refund' ? 'Refund note or transaction reference' : 'Payment note or transaction reference'} rows={2} className="w-full rounded-xl border bg-transparent p-3 dark:border-gray-700" />
+          <div className="flex items-center justify-between"><span className="text-sm text-gray-500">Available across listed POs: {money(paymentAvailableTotal)}</span><button disabled={working || paymentPoLoading || paymentTotal <= 0 || !selectedPaymentVendor} onClick={submitPayment} className={`inline-flex items-center gap-2 rounded-xl px-5 py-2.5 font-semibold text-white disabled:opacity-50 ${paymentMode === 'refund' ? 'bg-blue-600' : 'bg-emerald-600'}`}>{working && <Loader2 className="h-4 w-4 animate-spin" />}{paymentMode === 'refund' ? 'Record Refund From Vendor' : 'Record Payment'}</button></div>
+        </div>
+      </Modal>
+    </div>
+  );
+}

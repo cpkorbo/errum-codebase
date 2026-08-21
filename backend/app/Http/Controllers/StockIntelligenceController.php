@@ -1,0 +1,1712 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Carbon\Carbon;
+use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+
+/**
+ * StockIntelligenceController
+ *
+ * Two endpoints:
+ *
+ * 1. GET /api/inventory/intelligence
+ *    Product-level velocity + rebalancing suggestions (existing, fixed)
+ *
+ * 2. GET /api/inventory/intelligence/batch-report
+ *    Granular batch/PO-level report per product:
+ *    For each product → for each PO → for each batch from that PO:
+ *      - Batch number, PO number, vendor, received date, store
+ *      - Units received, remaining stock, units sold from that batch
+ *      - Revenue generated, COGS, gross profit from that batch
+ *      - Sell-through rate, days since received, velocity since receipt
+ *      - Which stores the batch has been dispatched to
+ */
+class StockIntelligenceController extends Controller
+{
+    // =========================================================================
+    // 1. Product-level intelligence (existing endpoint, fixed)
+    // GET /api/inventory/intelligence?days=30&store_id=&min_stock_gap=1
+    // =========================================================================
+    public function index(Request $request)
+    {
+        $days        = max(7, (int) $request->query('days', 30));
+        $filterStore = $request->query('store_id');
+        $minGap      = max(1, (int) $request->query('min_stock_gap', 1));
+
+        $from = Carbon::now()->subDays($days)->startOfDay();
+        $to   = Carbon::now()->endOfDay();
+
+        $salesRows = $this->getPerStoreSalesVelocity($from, $to, $filterStore);
+        $stockRows = $this->getCurrentStockPerStore($filterStore);
+
+        [$productMap, $storeMap] = $this->buildMaps($salesRows, $stockRows);
+
+        $intelligence  = $this->computeIntelligence($productMap, $storeMap, $days, $minGap);
+        $branchSummary = $this->buildBranchSummary($salesRows, $stockRows, $storeMap, $days);
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'period_days'       => $days,
+                'generated_at'      => Carbon::now()->toIso8601String(),
+                'branch_summary'    => $branchSummary,
+                'recommendations'   => $intelligence['recommendations'],
+                'best_sellers'      => $intelligence['best_sellers'],
+                'slow_movers'       => $intelligence['slow_movers'],
+                'cross_store_stars' => $intelligence['cross_store_stars'],
+                'stats' => [
+                    'total_products_tracked' => count($productMap),
+                    'total_recommendations'  => count($intelligence['recommendations']),
+                    'urgent_count'           => collect($intelligence['recommendations'])->where('urgency', 'urgent')->count(),
+                    'high_count'             => collect($intelligence['recommendations'])->where('urgency', 'high')->count(),
+                ],
+            ],
+        ]);
+    }
+
+    // =========================================================================
+    // 2. Batch/PO-level granular report
+    // GET /api/inventory/intelligence/batch-report
+    //   ?product_id=   (optional — filter to one product)
+    //   ?store_id=     (optional — filter by receiving store)
+    //   ?po_id=        (optional — filter to one PO)
+    //   ?search=       (optional — search product name/SKU/PO number)
+    //   ?sort_by=      (sold_units|remaining|sell_through|revenue|received_date)
+    //   ?sort_dir=     (desc|asc)
+    //   ?per_page=     (default 20)
+    //   ?page=         (default 1)
+    // =========================================================================
+    public function batchReport(Request $request)
+    {
+        $filterProduct = $request->query('product_id');
+        $filterStore   = $request->query('store_id');
+        $filterPO      = $request->query('po_id');
+        $search        = $request->query('search');
+        $sortBy        = $request->query('sort_by', 'received_date');
+        $sortDir       = strtolower($request->query('sort_dir', 'desc')) === 'asc' ? 'asc' : 'desc';
+        $perPage       = min(100, max(5, (int) $request->query('per_page', 20)));
+        $page          = max(1, (int) $request->query('page', 1));
+
+        // ── Step 1: Get all batches linked to POs ──────────────────────────
+        // The link is: product_batches ← purchase_order_items.product_batch_id
+        //              purchase_order_items → purchase_orders
+        $batchQuery = DB::table('product_batches as pb')
+            ->join('products as p',    'pb.product_id', '=', 'p.id')
+            ->join('stores as s',      'pb.store_id',   '=', 's.id')
+            // Link batch → PO item → PO
+            ->leftJoin('purchase_order_items as poi', 'poi.product_batch_id', '=', 'pb.id')
+            ->leftJoin('purchase_orders as po',       'poi.purchase_order_id', '=', 'po.id')
+            ->leftJoin('vendors as v',                'po.vendor_id', '=', 'v.id')
+            ->whereNull('p.deleted_at')
+            ->where('pb.is_active', true)
+            ->select([
+                'pb.id as batch_id',
+                'pb.batch_number',
+                'pb.product_id',
+                'p.name as product_name',
+                'p.sku as product_sku',
+                'pb.store_id',
+                's.name as store_name',
+                'pb.quantity as remaining_stock',
+                'pb.cost_price',
+                'pb.sell_price',
+                'pb.created_at as batch_created_at',
+                // PO fields (null if batch wasn't from a PO)
+                'po.id as po_id',
+                'po.po_number',
+                'po.order_date as po_order_date',
+                'po.actual_delivery_date as po_received_date',
+                'po.status as po_status',
+                'v.id as vendor_id',
+                'v.name as vendor_name',
+                // PO item fields
+                'poi.quantity_ordered',
+                'poi.quantity_received as po_qty_received',
+                'poi.unit_cost as po_unit_cost',
+                'poi.unit_sell_price as po_sell_price',
+            ]);
+
+        // Filters
+        if ($filterProduct) $batchQuery->where('pb.product_id', $filterProduct);
+        if ($filterStore)   $batchQuery->where('pb.store_id',   $filterStore);
+        if ($filterPO)      $batchQuery->where('po.id',         $filterPO);
+        if ($search) {
+            $batchQuery->where(function ($q) use ($search) {
+                $q->where('p.name',      'like', "%{$search}%")
+                  ->orWhere('p.sku',     'like', "%{$search}%")
+                  ->orWhere('pb.batch_number', 'like', "%{$search}%")
+                  ->orWhere('po.po_number',    'like', "%{$search}%");
+            });
+        }
+
+        $batches = $batchQuery->get();
+
+        if ($batches->isEmpty()) {
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'items'      => [],
+                    'total'      => 0,
+                    'page'       => $page,
+                    'per_page'   => $perPage,
+                    'last_page'  => 1,
+                    'summary'    => $this->emptyBatchSummary(),
+                ],
+            ]);
+        }
+
+        // ── Step 2: Get sales per batch ────────────────────────────────────
+        // order_items.product_batch_id links each sale line to its source batch
+        $batchIds = $batches->pluck('batch_id')->unique()->filter()->values()->toArray();
+
+        $salesPerBatch = DB::table('order_items as oi')
+            ->join('orders as o', 'oi.order_id', '=', 'o.id')
+            ->whereNull('o.deleted_at')
+            ->whereNotIn('o.status', ['cancelled', 'refunded'])
+            ->whereIn('oi.product_batch_id', $batchIds)
+            ->select([
+                'oi.product_batch_id as batch_id',
+                DB::raw('SUM(oi.quantity) as units_sold'),
+                DB::raw('SUM(oi.total_amount) as revenue'),
+                DB::raw('SUM(oi.cogs) as total_cogs'),
+                DB::raw('COUNT(DISTINCT o.id) as order_count'),
+                DB::raw('MIN(o.order_date) as first_sale_date'),
+                DB::raw('MAX(o.order_date) as last_sale_date'),
+            ])
+            ->groupBy('oi.product_batch_id')
+            ->get()
+            ->keyBy('batch_id');
+
+        // ── Step 3: Get store distribution (where barcodes of this batch went) ──
+        $barcodeDistrib = DB::table('product_barcodes as bc')
+            ->join('stores as s', 'bc.current_store_id', '=', 's.id')
+            ->whereIn('bc.batch_id', $batchIds)
+            ->where('bc.is_active', true)
+            ->select([
+                'bc.batch_id',
+                'bc.current_store_id as store_id',
+                's.name as store_name',
+                'bc.current_status',
+                DB::raw('COUNT(*) as barcode_count'),
+            ])
+            ->groupBy('bc.batch_id', 'bc.current_store_id', 's.name', 'bc.current_status')
+            ->get()
+            ->groupBy('batch_id');
+
+        // ── Step 4: Enrich each batch row ──────────────────────────────────
+        $enriched = $batches->map(function ($batch) use ($salesPerBatch, $barcodeDistrib) {
+            $sales    = $salesPerBatch[$batch->batch_id] ?? null;
+            $distrib  = $barcodeDistrib[$batch->batch_id] ?? collect();
+
+            $unitsSold     = $sales ? (int) $sales->units_sold    : 0;
+            $revenue       = $sales ? round((float) $sales->revenue, 2)    : 0.0;
+            $totalCogs     = $sales ? round((float) $sales->total_cogs, 2) : 0.0;
+            $grossProfit   = round($revenue - $totalCogs, 2);
+            $orderCount    = $sales ? (int) $sales->order_count   : 0;
+            $firstSale     = $sales ? $sales->first_sale_date     : null;
+            $lastSale      = $sales ? $sales->last_sale_date      : null;
+
+            // Units received from PO (or fall back to remaining + sold if no PO link)
+            $poQtyReceived   = $batch->po_qty_received ?? null;
+            $originalQty     = $poQtyReceived ?? ($batch->remaining_stock + $unitsSold);
+            $remaining       = (int) $batch->remaining_stock;
+
+            // Sell-through rate
+            $sellThrough = $originalQty > 0
+                ? round(($unitsSold / $originalQty) * 100, 1)
+                : 0.0;
+
+            // Days since received / batch created
+            $receivedAt  = $batch->po_received_date ?? $batch->batch_created_at;
+            $daysSinceReceived = $receivedAt
+                ? Carbon::parse($receivedAt)->diffInDays(Carbon::now())
+                : null;
+
+            // Velocity since receipt (units/day)
+            $velocitySinceReceipt = ($daysSinceReceived && $daysSinceReceived > 0)
+                ? round($unitsSold / $daysSinceReceived, 3)
+                : 0.0;
+
+            // Days of stock remaining at current velocity
+            $daysOfStock = ($velocitySinceReceipt > 0 && $remaining > 0)
+                ? round($remaining / $velocitySinceReceipt)
+                : ($remaining > 0 ? 999 : 0);
+
+            // Store distribution summary
+            $distribSummary = $distrib->groupBy('store_id')->map(function ($rows, $storeId) {
+                return [
+                    'store_id'   => (int) $storeId,
+                    'store_name' => $rows->first()->store_name,
+                    'count'      => $rows->sum('barcode_count'),
+                    'statuses'   => $rows->pluck('current_status', 'current_status')->keys()->values(),
+                ];
+            })->values()->toArray();
+
+            return [
+                // Batch info
+                'batch_id'              => (int) $batch->batch_id,
+                'batch_number'          => $batch->batch_number,
+                'batch_created_at'      => $batch->batch_created_at,
+
+                // Product info
+                'product_id'            => (int) $batch->product_id,
+                'product_name'          => $batch->product_name,
+                'product_sku'           => $batch->product_sku,
+
+                // Store info (original receiving store)
+                'store_id'              => (int) $batch->store_id,
+                'store_name'            => $batch->store_name,
+
+                // PO info (null if batch wasn't created from a PO)
+                'po_id'                 => $batch->po_id ? (int) $batch->po_id : null,
+                'po_number'             => $batch->po_number,
+                'po_order_date'         => $batch->po_order_date,
+                'po_received_date'      => $batch->po_received_date,
+                'po_status'             => $batch->po_status,
+                'vendor_id'             => $batch->vendor_id ? (int) $batch->vendor_id : null,
+                'vendor_name'           => $batch->vendor_name,
+
+                // Stock
+                'original_qty'          => (int) $originalQty,
+                'remaining_stock'       => $remaining,
+                'cost_price'            => round((float) $batch->cost_price, 2),
+                'sell_price'            => round((float) $batch->sell_price, 2),
+
+                // Sales performance
+                'units_sold'            => $unitsSold,
+                'order_count'           => $orderCount,
+                'revenue'               => $revenue,
+                'total_cogs'            => $totalCogs,
+                'gross_profit'          => $grossProfit,
+                'margin_pct'            => $revenue > 0 ? round(($grossProfit / $revenue) * 100, 1) : 0.0,
+                'first_sale_date'       => $firstSale,
+                'last_sale_date'        => $lastSale,
+
+                // Intelligence
+                'sell_through_pct'      => $sellThrough,
+                'days_since_received'   => $daysSinceReceived,
+                'velocity_per_day'      => $velocitySinceReceipt,
+                'days_of_stock'         => $daysOfStock === 999 ? null : $daysOfStock,
+                'stock_value'           => round($remaining * (float) $batch->cost_price, 2),
+                'potential_revenue'     => round($remaining * (float) $batch->sell_price, 2),
+
+                // Where barcodes of this batch currently are
+                'store_distribution'    => $distribSummary,
+            ];
+        });
+
+        // ── Step 5: Sort ───────────────────────────────────────────────────
+        $sortMap = [
+            'sold_units'    => 'units_sold',
+            'remaining'     => 'remaining_stock',
+            'sell_through'  => 'sell_through_pct',
+            'revenue'       => 'revenue',
+            'received_date' => 'po_received_date',
+            'velocity'      => 'velocity_per_day',
+            'days_of_stock' => 'days_of_stock',
+        ];
+        $sortField = $sortMap[$sortBy] ?? 'po_received_date';
+
+        $sorted = $sortDir === 'asc'
+            ? $enriched->sortBy($sortField, SORT_REGULAR, false)
+            : $enriched->sortByDesc($sortField);
+
+        // ── Step 6: Group by product then by PO ───────────────────────────
+        $grouped = $sorted->groupBy('product_id')->map(function ($productBatches, $productId) {
+            $first = $productBatches->first();
+
+            // Group batches by PO within each product
+            $byPO = $productBatches->groupBy(fn($b) => $b['po_number'] ?? 'no_po')->map(function ($poBatches, $poKey) {
+                $firstPO = $poBatches->first();
+                return [
+                    'po_id'           => $firstPO['po_id'],
+                    'po_number'       => $firstPO['po_number'] ?? 'Manual/Direct',
+                    'po_order_date'   => $firstPO['po_order_date'],
+                    'po_received_date'=> $firstPO['po_received_date'],
+                    'po_status'       => $firstPO['po_status'],
+                    'vendor_id'       => $firstPO['vendor_id'],
+                    'vendor_name'     => $firstPO['vendor_name'] ?? 'Unknown',
+                    // PO-level totals
+                    'po_original_qty' => $poBatches->sum('original_qty'),
+                    'po_remaining'    => $poBatches->sum('remaining_stock'),
+                    'po_units_sold'   => $poBatches->sum('units_sold'),
+                    'po_revenue'      => round($poBatches->sum('revenue'), 2),
+                    'po_gross_profit' => round($poBatches->sum('gross_profit'), 2),
+                    'po_sell_through' => $poBatches->sum('original_qty') > 0
+                        ? round(($poBatches->sum('units_sold') / $poBatches->sum('original_qty')) * 100, 1)
+                        : 0.0,
+                    'po_stock_value'  => round($poBatches->sum('stock_value'), 2),
+                    // Individual batches under this PO
+                    'batches'         => $poBatches->values()->toArray(),
+                ];
+            })->values();
+
+            // Product-level totals
+            return [
+                'product_id'       => (int) $productId,
+                'product_name'     => $first['product_name'],
+                'product_sku'      => $first['product_sku'],
+                'total_original'   => $productBatches->sum('original_qty'),
+                'total_remaining'  => $productBatches->sum('remaining_stock'),
+                'total_sold'       => $productBatches->sum('units_sold'),
+                'total_revenue'    => round($productBatches->sum('revenue'), 2),
+                'total_profit'     => round($productBatches->sum('gross_profit'), 2),
+                'overall_sell_through' => $productBatches->sum('original_qty') > 0
+                    ? round(($productBatches->sum('units_sold') / $productBatches->sum('original_qty')) * 100, 1)
+                    : 0.0,
+                'avg_velocity'     => round($productBatches->avg('velocity_per_day'), 3),
+                'total_stock_value'=> round($productBatches->sum('stock_value'), 2),
+                'po_count'         => $by_po_count = $productBatches->pluck('po_number')->unique()->filter()->count(),
+                'batch_count'      => $productBatches->count(),
+                'by_po'            => $byPO->toArray(),
+            ];
+        })->values();
+
+        // ── Step 7: Paginate ───────────────────────────────────────────────
+        $total      = $grouped->count();
+        $lastPage   = max(1, (int) ceil($total / $perPage));
+        $offset     = ($page - 1) * $perPage;
+        $paginated  = $grouped->slice($offset, $perPage)->values();
+
+        // ── Step 8: Overall summary ────────────────────────────────────────
+        $allEnriched = $enriched; // full set before pagination
+        $summary = [
+            'total_products'   => $grouped->count(),
+            'total_batches'    => $allEnriched->count(),
+            'total_pos'        => $allEnriched->pluck('po_number')->unique()->filter()->count(),
+            'total_original'   => $allEnriched->sum('original_qty'),
+            'total_remaining'  => $allEnriched->sum('remaining_stock'),
+            'total_sold'       => $allEnriched->sum('units_sold'),
+            'total_revenue'    => round($allEnriched->sum('revenue'), 2),
+            'total_profit'     => round($allEnriched->sum('gross_profit'), 2),
+            'total_stock_value'=> round($allEnriched->sum('stock_value'), 2),
+            'overall_sell_through' => $allEnriched->sum('original_qty') > 0
+                ? round(($allEnriched->sum('units_sold') / $allEnriched->sum('original_qty')) * 100, 1)
+                : 0.0,
+        ];
+
+        return response()->json([
+            'success'  => true,
+            'data' => [
+                'items'     => $paginated,
+                'total'     => $total,
+                'page'      => $page,
+                'per_page'  => $perPage,
+                'last_page' => $lastPage,
+                'summary'   => $summary,
+            ],
+        ]);
+    }
+
+
+    // =========================================================================
+    // 3. Combined inventory view intelligence
+    // GET /api/inventory/intelligence/overview
+    //   ?date_preset=365|90|30|7|today|custom
+    //   ?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD   (used for custom or explicit range)
+    //   ?category_id=&store_id=&search=&page=&per_page=
+    //
+    // store_id filters the sheet to one branch/store. Date range affects movement counts (purchase/sell/dispatch/defect/velocity).
+    // Current stock always reflects the latest stock state.
+    // =========================================================================
+    public function overview(Request $request)
+    {
+        try {
+            [$from, $to, $periodDays, $datePreset] = $this->resolveOverviewDateRange($request);
+
+            $search  = trim((string) $request->query('search', ''));
+            $perPage = min(100, max(10, (int) $request->query('per_page', 50)));
+            $page    = max(1, (int) $request->query('page', 1));
+            $selectedStoreId = (int) $request->query('store_id', 0);
+
+            // Inventory View must show every active location that can hold stock:
+            // offline stores, online stores and warehouses. The production data can
+            // contain duplicate location rows (for example the same branch imported
+            // twice, or "Main Store (Mirpur)" plus "Mirpur"). Build one canonical
+            // sheet column per real location, but keep an alias map so stock/movement
+            // saved under duplicate store IDs is merged into that canonical column.
+            $storeCanonical = $this->overviewCanonicalStoreRows();
+            $storeRowsForFilter = $storeCanonical['stores'];
+            $storeIdMap = $storeCanonical['id_map'];
+            $storeAliasMap = $storeCanonical['aliases'];
+
+            if ($selectedStoreId > 0) {
+                $selectedStoreId = (int) ($storeIdMap[$selectedStoreId] ?? 0);
+            }
+            $selectedStoreSourceIds = $selectedStoreId > 0
+                ? array_values(array_unique(array_map('intval', $storeAliasMap[$selectedStoreId] ?? [$selectedStoreId])))
+                : [];
+
+            $storesForFilterPayload = $storeRowsForFilter->map(fn($s) => [
+                'id' => (int) $s->id,
+                'name' => $s->name,
+                'store_code' => $s->store_code ?? null,
+                'is_warehouse' => (bool) ($s->is_warehouse ?? false),
+                'is_online' => (bool) ($s->is_online ?? false),
+            ])->toArray();
+
+            $productQuery = DB::table('products as p')
+                ->leftJoin('categories as c', 'p.category_id', '=', 'c.id')
+                ->leftJoin('categories as pc', 'c.parent_id', '=', 'pc.id')
+                ->whereNull('p.deleted_at')
+                ->where('p.is_archived', false)
+                ->select([
+                    'p.id as product_id',
+                    'p.sku',
+                    'p.name as product_name',
+                    'p.base_name',
+                    'p.variation_suffix',
+                    'p.brand',
+                    'p.category_id',
+                    DB::raw("CASE WHEN pc.id IS NOT NULL THEN pc.title ELSE COALESCE(c.title, 'Uncategorized') END as category_name"),
+                    DB::raw("CASE WHEN pc.id IS NOT NULL THEN c.title ELSE '-' END as subcategory_name"),
+                ]);
+
+            $requestedCategoryIds = collect();
+            if ($request->filled('category_ids')) {
+                $rawCategoryIds = $request->query('category_ids');
+                $rawCategoryIds = is_array($rawCategoryIds) ? $rawCategoryIds : preg_split('/[,|]/', (string) $rawCategoryIds);
+                $requestedCategoryIds = $requestedCategoryIds->merge($rawCategoryIds);
+            }
+            if ($request->filled('subcategory_ids')) {
+                $rawSubCategoryIds = $request->query('subcategory_ids');
+                $rawSubCategoryIds = is_array($rawSubCategoryIds) ? $rawSubCategoryIds : preg_split('/[,|]/', (string) $rawSubCategoryIds);
+                $requestedCategoryIds = $requestedCategoryIds->merge($rawSubCategoryIds);
+            }
+            if ($request->filled('category_id')) {
+                $requestedCategoryIds->push($request->query('category_id'));
+            }
+            if ($request->filled('subcategory_id')) {
+                $requestedCategoryIds->push($request->query('subcategory_id'));
+            }
+
+            $requestedCategoryIds = $requestedCategoryIds
+                ->map(fn ($id) => (int) $id)
+                ->filter(fn ($id) => $id > 0)
+                ->unique()
+                ->values();
+
+            if ($requestedCategoryIds->isNotEmpty()) {
+                $categoryIds = $requestedCategoryIds->all();
+                try {
+                    foreach ($requestedCategoryIds as $categoryId) {
+                        $category = \App\Models\Category::find($categoryId);
+                        if ($category && method_exists($category, 'descendants')) {
+                            $categoryIds = array_merge(
+                                $categoryIds,
+                                $category->descendants()->pluck('id')->push($category->id)->toArray()
+                            );
+                        }
+                    }
+                    $categoryIds = array_values(array_unique(array_map('intval', $categoryIds)));
+                } catch (\Throwable $e) {
+                    // Fallback to the selected categories only.
+                }
+                $productQuery->whereIn('p.category_id', $categoryIds);
+            }
+
+            $size = trim((string) $request->query('size', ''));
+            if ($size !== '') {
+                // Size/variation filtering is intentionally strict. A short size like
+                // "L" must match the real variation token "L" only; it must not
+                // match product names, "XL", "M", "US-42", etc.
+                $this->applyExactVariationFilter($productQuery, $size);
+            }
+
+            if ($search !== '') {
+                $like = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $search) . '%';
+
+                $productQuery->where(function ($q) use ($like) {
+                    $q->where('p.name', 'like', $like)
+                        ->orWhere('p.base_name', 'like', $like)
+                        ->orWhere('p.sku', 'like', $like);
+                });
+            }
+
+            // Branch/store filter for Inventory View: when a store is selected, show
+            // product families that currently have stock in that store. This prevents
+            // the page from calculating global stock and then merely hiding rows on
+            // the frontend.
+            if ($selectedStoreId > 0) {
+                $productQuery->whereExists(function ($q) use ($selectedStoreSourceIds) {
+                    $q->select(DB::raw(1))
+                        ->from('product_batches as branch_pb')
+                        ->whereColumn('branch_pb.product_id', 'p.id')
+                        ->whereIn('branch_pb.store_id', $selectedStoreSourceIds)
+                        ->where('branch_pb.is_active', true)
+                        ->where('branch_pb.quantity', '>', 0);
+                });
+            }
+
+            $products = $productQuery
+                ->orderByRaw('COALESCE(p.base_name, p.name) asc')
+                ->orderBy('p.variation_suffix')
+                ->get();
+
+            if ($products->isEmpty()) {
+                return response()->json([
+                    'success' => true,
+                    'data' => [
+                        'filters' => [
+                            'date_preset' => $datePreset,
+                            'start_date' => $from->toDateString(),
+                            'end_date' => $to->toDateString(),
+                            'period_days' => $periodDays,
+                            'store_id' => $selectedStoreId > 0 ? $selectedStoreId : null,
+                        ],
+                        'summary' => $this->emptyOverviewSummary(),
+                        'stores' => $storesForFilterPayload,
+                        'items' => [],
+                        'total' => 0,
+                        'page' => $page,
+                        'per_page' => $perPage,
+                        'last_page' => 1,
+                    ],
+                ]);
+            }
+
+            // Group the inventory view by product family, not by the individual
+            // variant product row. Previously this used SKU only. In real Errum data,
+            // the same visible product can have separate variant rows/SKUs, so searching
+            // a product showed the same base product repeatedly. This key collapses
+            // variations with the same base product name/category/brand into one row,
+            // while still keeping variation stock details inside the `variations` array.
+            $groupedProducts = $products->groupBy(function ($p) {
+                return $this->overviewProductFamilyKey($p);
+            })->sortBy(function ($group) {
+                $first = $group->first();
+                return strtolower($first->base_name ?: $first->product_name ?: '');
+            });
+
+            $totalGroups = $groupedProducts->count();
+            $lastPage = max(1, (int) ceil($totalGroups / $perPage));
+            $pageGroups = $groupedProducts->slice(($page - 1) * $perPage, $perPage);
+            $pageProductIds = $pageGroups->flatten(1)->pluck('product_id')->unique()->filter()->values()->toArray();
+
+            if (empty($pageProductIds)) {
+                return response()->json([
+                    'success' => true,
+                    'data' => [
+                        'filters' => [
+                            'date_preset' => $datePreset,
+                            'start_date' => $from->toDateString(),
+                            'end_date' => $to->toDateString(),
+                            'period_days' => $periodDays,
+                            'store_id' => $selectedStoreId > 0 ? $selectedStoreId : null,
+                        ],
+                        'summary' => $this->emptyOverviewSummary(),
+                        'stores' => $storesForFilterPayload,
+                        'items' => [],
+                        'total' => $totalGroups,
+                        'page' => $page,
+                        'per_page' => $perPage,
+                        'last_page' => $lastPage,
+                    ],
+                ]);
+            }
+
+            $stores = $storeRowsForFilter->keyBy('id');
+
+            $currentStock = $this->overviewCurrentStock($pageProductIds, $selectedStoreSourceIds, $storeIdMap, $storeRowsForFilter);
+            $reserved = DB::table('reserved_products')
+                ->whereIn('product_id', $pageProductIds)
+                ->select('product_id', 'reserved_inventory', 'available_inventory')
+                ->get()
+                ->keyBy('product_id');
+
+            $purchases = $this->overviewPurchases($pageProductIds, $from, $to, $selectedStoreSourceIds, $storeIdMap);
+            $sales = $this->overviewSales($pageProductIds, $from, $to, $selectedStoreSourceIds, $storeIdMap);
+            $dispatchOut = $this->overviewDispatchOut($pageProductIds, $from, $to, $selectedStoreSourceIds, $storeIdMap);
+            $dispatchReceived = $this->overviewDispatchReceived($pageProductIds, $from, $to, $selectedStoreSourceIds, $storeIdMap);
+            $defects = $this->overviewDefects($pageProductIds, $from, $to, $selectedStoreSourceIds, $storeIdMap);
+            $batches = $this->overviewBatchDetails($pageProductIds, $from, $to, $selectedStoreSourceIds, $storeIdMap, $storeRowsForFilter, $this->canViewInventoryCostPrice());
+
+            $allStoreIds = $selectedStoreId > 0
+                ? collect([$selectedStoreId])
+                : $stores->keys()->unique()->filter()->values();
+
+            $items = [];
+            $summary = $this->emptyOverviewSummary();
+
+            foreach ($pageGroups as $groupKey => $groupProducts) {
+                $first = $groupProducts->first();
+                $groupProductIds = $groupProducts->pluck('product_id')->unique()->values()->toArray();
+
+                $groupStoreRows = [];
+                $groupBatches = $batches->whereIn('product_id', $groupProductIds);
+
+                foreach ($allStoreIds as $storeIdRaw) {
+                    $storeId = (int) $storeIdRaw;
+                    $store = $stores->get($storeId);
+
+                    $physicalStock = 0;
+                    $stockValue = 0.0;
+                    $currentBatchCount = 0;
+                    $purchaseQty = 0;
+                    $soldQty = 0;
+                    $salesRevenue = 0.0;
+                    $dispatchOutQty = 0;
+                    $dispatchReceivedQty = 0;
+                    $defectQty = 0;
+                    $poNumbers = [];
+
+                    foreach ($groupProductIds as $pid) {
+                        $stockRow = $currentStock[$pid][$storeId] ?? null;
+                        if ($stockRow) {
+                            $physicalStock += (int) $stockRow['physical_stock'];
+                            $stockValue += (float) $stockRow['stock_value'];
+                            $currentBatchCount += (int) $stockRow['batches_count'];
+                        }
+
+                        $purchaseRow = $purchases[$pid][$storeId] ?? null;
+                        if ($purchaseRow) {
+                            $purchaseQty += (int) $purchaseRow['total_purchase'];
+                            foreach ($purchaseRow['po_numbers'] as $poNo) $poNumbers[$poNo] = true;
+                        }
+
+                        $salesRow = $sales[$pid][$storeId] ?? null;
+                        if ($salesRow) {
+                            $soldQty += (int) $salesRow['total_sell'];
+                            $salesRevenue += (float) $salesRow['sales_revenue'];
+                        }
+
+                        $outRow = $dispatchOut[$pid][$storeId] ?? null;
+                        if ($outRow) $dispatchOutQty += (int) $outRow['total_dispatch_out'];
+
+                        $receiveRow = $dispatchReceived[$pid][$storeId] ?? null;
+                        if ($receiveRow) $dispatchReceivedQty += (int) $receiveRow['total_dispatch_received'];
+
+                        $defectRow = $defects[$pid][$storeId] ?? null;
+                        if ($defectRow) $defectQty += (int) $defectRow['total_defect'];
+                    }
+
+                    $storeBatches = $groupBatches->where('store_id', $storeId)->values();
+                    foreach ($storeBatches as $b) {
+                        if (!empty($b['po_number'])) $poNumbers[$b['po_number']] = true;
+                    }
+
+                    if (
+                        $physicalStock === 0 && $purchaseQty === 0 && $soldQty === 0 &&
+                        $dispatchOutQty === 0 && $dispatchReceivedQty === 0 && $defectQty === 0 &&
+                        $storeBatches->isEmpty()
+                    ) {
+                        continue;
+                    }
+
+                    $velocity = $periodDays > 0 ? round($soldQty / $periodDays, 4) : 0.0;
+                    $daysOfCover = $velocity > 0 ? round($physicalStock / $velocity, 1) : null;
+                    $status = $this->overviewStockStatus($physicalStock, $velocity, $daysOfCover, $soldQty);
+
+                    $groupStoreRows[] = [
+                        'store_id' => $storeId,
+                        'store_name' => $store->name ?? ('Store ' . $storeId),
+                        'store_code' => $store->store_code ?? null,
+                        'current_stock' => $physicalStock,
+                        'stock_value' => round($stockValue, 2),
+                        'batch_count' => max($currentBatchCount, $storeBatches->count()),
+                        'po_count' => count($poNumbers),
+                        'total_purchase' => $purchaseQty,
+                        'total_sell' => $soldQty,
+                        'sales_revenue' => round($salesRevenue, 2),
+                        'total_dispatch_out' => $dispatchOutQty,
+                        'total_dispatch_received' => $dispatchReceivedQty,
+                        'total_defect' => $defectQty,
+                        'velocity_per_day' => $velocity,
+                        'days_of_cover' => $daysOfCover,
+                        'stock_status' => $status,
+                        'batches' => $storeBatches->toArray(),
+                    ];
+                }
+
+                $groupStoreRows = collect($groupStoreRows)->sortBy('store_name')->values()->toArray();
+
+                // Global-available = latest live product-batch stock before reservation deduction.
+                // Physical stock = global-available - reserved. We calculate this directly
+                // instead of trusting reserved_products.available_inventory, so stale reservation
+                // rows cannot show the wrong sellable stock on inventory/view.
+                $totalGlobalAvailable = array_sum(array_column($groupStoreRows, 'current_stock'));
+                $totalPurchase = array_sum(array_column($groupStoreRows, 'total_purchase'));
+                $totalSold = array_sum(array_column($groupStoreRows, 'total_sell'));
+                $totalDispatchOut = array_sum(array_column($groupStoreRows, 'total_dispatch_out'));
+                $totalDispatchReceived = array_sum(array_column($groupStoreRows, 'total_dispatch_received'));
+                $totalDefect = array_sum(array_column($groupStoreRows, 'total_defect'));
+                $totalStockValue = array_sum(array_column($groupStoreRows, 'stock_value'));
+                $totalVelocity = $periodDays > 0 ? round($totalSold / $periodDays, 4) : 0.0;
+                $totalReserved = 0;
+                if ($selectedStoreId <= 0) {
+                    foreach ($groupProductIds as $pid) {
+                        $reservedRow = $reserved->get($pid);
+                        $totalReserved += $reservedRow ? (int) $reservedRow->reserved_inventory : 0;
+                    }
+                }
+                $totalPhysicalStock = max(0, $totalGlobalAvailable - $totalReserved);
+                $totalDaysCover = $totalVelocity > 0 ? round($totalPhysicalStock / $totalVelocity, 1) : null;
+                $groupStatus = $this->overviewProductStatus($groupStoreRows, $totalPhysicalStock, $totalVelocity, $totalDaysCover);
+                $movementRecommendation = $this->overviewMovementRecommendation($groupStoreRows, $periodDays);
+
+                $variations = $groupProducts->map(function ($p) use ($currentStock, $reserved, $selectedStoreId) {
+                    $productId = (int) $p->product_id;
+                    $globalAvailable = 0;
+                    $stores = [];
+                    if (isset($currentStock[$productId])) {
+                        foreach ($currentStock[$productId] as $sid => $row) {
+                            $globalAvailable += (int) $row['physical_stock'];
+                            $stores[] = [
+                                'store_id' => (int) $sid,
+                                'store_name' => $row['store_name'],
+                                'quantity' => (int) $row['physical_stock'],
+                                'batches_count' => (int) $row['batches_count'],
+                            ];
+                        }
+                    }
+                    $reservedRow = $reserved->get($productId);
+                    $reservedQty = ($selectedStoreId > 0 || !$reservedRow) ? 0 : (int) $reservedRow->reserved_inventory;
+                    $physicalQty = max(0, $globalAvailable - $reservedQty);
+
+                    return [
+                        'product_id' => $productId,
+                        'product_name' => $p->product_name,
+                        'variation_suffix' => $p->variation_suffix ?: trim(str_replace((string) $p->base_name, '', (string) $p->product_name)),
+                        'global_available_stock' => $globalAvailable,
+                        'physical_stock' => $physicalQty,
+                        // Backward-compatible aliases for older frontend builds.
+                        'current_stock' => $globalAvailable,
+                        'available_stock' => $physicalQty,
+                        'reserved_stock' => $reservedQty,
+                        'stores' => $stores,
+                    ];
+                })->values()->toArray();
+
+                $groupPoCount = $groupBatches->pluck('po_number')->filter()->unique()->count();
+                $groupBatchCount = $groupBatches->pluck('batch_id')->unique()->count();
+                $groupSkus = $groupProducts->pluck('sku')->filter()->unique()->values();
+                $displaySku = $groupSkus->isNotEmpty() ? $groupSkus->implode(', ') : 'NO-SKU';
+
+                $summary['total_current_stock'] += $totalGlobalAvailable;
+                $summary['total_available_stock'] += $totalPhysicalStock;
+                $summary['total_reserved_stock'] += $totalReserved;
+                $summary['total_purchase'] += $totalPurchase;
+                $summary['total_sell'] += $totalSold;
+                $summary['total_dispatch_out'] += $totalDispatchOut;
+                $summary['total_dispatch_received'] += $totalDispatchReceived;
+                $summary['total_defect'] += $totalDefect;
+                $summary['total_stock_value'] += $totalStockValue;
+                if ($groupStatus === 'low' || $groupStatus === 'out_of_stock') $summary['low_stock_count'] += 1;
+                if ($groupStatus === 'high' || $groupStatus === 'slow_moving') $summary['high_stock_count'] += 1;
+                if (!empty($movementRecommendation)) $summary['recommendation_count'] += 1;
+
+                $items[] = [
+                    'group_key' => (string) $groupKey,
+                    'sku' => $displaySku,
+                    'skus' => $groupSkus->toArray(),
+                    'product_name' => $first->base_name ?: $first->product_name,
+                    'category_id' => $first->category_id,
+                    'category_name' => $first->category_name,
+                    'subcategory_name' => $first->subcategory_name,
+                    'global_available_stock' => $totalGlobalAvailable,
+                    'physical_stock' => $totalPhysicalStock,
+                    // Backward-compatible aliases for older frontend builds.
+                    'current_stock' => $totalGlobalAvailable,
+                    'available_stock' => $totalPhysicalStock,
+                    'reserved_stock' => $totalReserved,
+                    'total_purchase' => $totalPurchase,
+                    'total_sell' => $totalSold,
+                    'total_dispatch_out' => $totalDispatchOut,
+                    'total_dispatch_received' => $totalDispatchReceived,
+                    'total_defect' => $totalDefect,
+                    'po_count' => $groupPoCount,
+                    'batch_count' => $groupBatchCount,
+                    'velocity_per_day' => $totalVelocity,
+                    'days_of_cover' => $totalDaysCover,
+                    'stock_status' => $groupStatus,
+                    'stock_value' => round($totalStockValue, 2),
+                    'movement_recommendation' => $movementRecommendation,
+                    'stores' => $groupStoreRows,
+                    'variations' => $variations,
+                ];
+            }
+
+            $summary['total_products'] = $totalGroups;
+            $summary['page_products'] = count($items);
+            $summary['total_stock_value'] = round($summary['total_stock_value'], 2);
+            $summary['generated_at'] = Carbon::now()->toIso8601String();
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'filters' => [
+                        'date_preset' => $datePreset,
+                        'start_date' => $from->toDateString(),
+                        'end_date' => $to->toDateString(),
+                        'period_days' => $periodDays,
+                        'store_id' => $selectedStoreId > 0 ? $selectedStoreId : null,
+                    ],
+                    'summary' => $summary,
+                    'stores' => $stores->values()->map(fn($s) => [
+                        'id' => (int) $s->id,
+                        'name' => $s->name,
+                        'store_code' => $s->store_code ?? null,
+                        'is_warehouse' => (bool) ($s->is_warehouse ?? false),
+                        'is_online' => (bool) ($s->is_online ?? false),
+                    ])->toArray(),
+                    'items' => $items,
+                    'total' => $totalGroups,
+                    'page' => $page,
+                    'per_page' => $perPage,
+                    'last_page' => $lastPage,
+                ],
+            ]);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to build inventory overview: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Build a stable grouping key for the Inventory View page.
+     *
+     * Product variations are stored as individual product rows, but Inventory View
+     * should show one visible product row and keep the sizes/colors in the variation
+     * stock cell. SKU-only grouping is not enough when imported variations have
+     * separate SKUs, so we prefer the shared base_name/category/brand family.
+     */
+    /**
+     * Apply the dedicated Inventory View size filter against variation_suffix only.
+     *
+     * The old broad LIKE filter looked at product/base names, so typing a tiny size
+     * such as "L" could return unrelated variants like "M" or "US-42" simply
+     * because the product name contained the letter l. This filter treats size as a
+     * real variation token: full normalized match (US-42 == US42) or separated token
+     * match (42 inside US-42, L inside L / XL), never substring match (L != XL).
+     */
+    private function applyExactVariationFilter($productQuery, string $size): void
+    {
+        $raw = trim($size);
+        if ($raw === '') {
+            return;
+        }
+
+        $normalizedFull = strtolower(preg_replace('/[^a-z0-9]+/i', '', $raw));
+        $normalizedToken = strtolower(trim($raw));
+        $normalizedToken = preg_replace('/\s+/', ' ', $normalizedToken);
+
+        $tokenNeedle = '% ' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $normalizedToken) . ' %';
+        $normalizedNeedle = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $normalizedFull);
+
+        $productQuery->where(function ($q) use ($normalizedNeedle, $tokenNeedle) {
+            $normalizedVariationSql = "LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(COALESCE(p.variation_suffix, '')), ' ', ''), '-', ''), '/', ''), '_', ''), '.', ''), ',', ''))";
+            $tokenizedVariationSql = "LOWER(CONCAT(' ', REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(p.variation_suffix, ''), '/', ' '), '-', ' '), '_', ' '), ',', ' '), '.', ' '), '(', ' '), ')', ' '), ' '))";
+
+            $q->whereRaw("{$normalizedVariationSql} = ?", [$normalizedNeedle])
+                ->orWhereRaw("{$tokenizedVariationSql} LIKE ?", [$tokenNeedle]);
+        });
+    }
+
+    private function overviewProductFamilyKey($product): string
+    {
+        $categoryId = (int) ($product->category_id ?? 0);
+        $brand = strtolower(trim((string) ($product->brand ?? '')));
+        $baseName = trim((string) ($product->base_name ?? ''));
+
+        if ($baseName === '') {
+            $baseName = trim((string) ($product->product_name ?? ''));
+            $suffix = trim((string) ($product->variation_suffix ?? ''));
+            if ($suffix !== '' && substr($baseName, -strlen($suffix)) === $suffix) {
+                $baseName = trim(substr($baseName, 0, -strlen($suffix)));
+            }
+        }
+
+        $normalizedBaseName = preg_replace('/\s+/', ' ', strtolower($baseName));
+
+        if ($normalizedBaseName !== '') {
+            return 'FAMILY:' . sha1($categoryId . '|' . $brand . '|' . $normalizedBaseName);
+        }
+
+        if (!empty($product->sku)) {
+            return 'SKU:' . (string) $product->sku;
+        }
+
+        return 'PRODUCT:' . (int) $product->product_id;
+    }
+
+    private function resolveOverviewDateRange(Request $request): array
+    {
+        $preset = (string) $request->query('date_preset', '365');
+
+        if ($request->filled('start_date') && $request->filled('end_date')) {
+            $from = Carbon::parse($request->query('start_date'))->startOfDay();
+            $to = Carbon::parse($request->query('end_date'))->endOfDay();
+            if ($from->greaterThan($to)) {
+                [$from, $to] = [$to->copy()->startOfDay(), $from->copy()->endOfDay()];
+            }
+            $days = max(1, $from->diffInDays($to) + 1);
+            return [$from, $to, $days, $preset === 'custom' ? 'custom' : 'custom'];
+        }
+
+        $now = Carbon::now();
+        switch ($preset) {
+            case 'today':
+                $from = $now->copy()->startOfDay();
+                $to = $now->copy()->endOfDay();
+                break;
+            case '7':
+            case '30':
+            case '90':
+            case '365':
+                $days = (int) $preset;
+                $from = $now->copy()->subDays($days - 1)->startOfDay();
+                $to = $now->copy()->endOfDay();
+                break;
+            default:
+                $preset = '365';
+                $from = $now->copy()->subDays(364)->startOfDay();
+                $to = $now->copy()->endOfDay();
+                break;
+        }
+
+        $days = max(1, $from->diffInDays($to) + 1);
+        return [$from, $to, $days, $preset];
+    }
+
+    private function emptyOverviewSummary(): array
+    {
+        return [
+            'total_products' => 0,
+            'page_products' => 0,
+            'total_current_stock' => 0,
+            'total_available_stock' => 0,
+            'total_reserved_stock' => 0,
+            'total_purchase' => 0,
+            'total_sell' => 0,
+            'total_dispatch_out' => 0,
+            'total_dispatch_received' => 0,
+            'total_defect' => 0,
+            'total_stock_value' => 0,
+            'low_stock_count' => 0,
+            'high_stock_count' => 0,
+            'recommendation_count' => 0,
+            'generated_at' => null,
+        ];
+    }
+
+
+
+    /**
+     * Normalize store/warehouse names only for duplicate detection in the
+     * inventory overview sheet.
+     *
+     * Important: do NOT remove words like "warehouse" or "online" globally,
+     * because Inventory View must show active warehouses and online locations
+     * as separate stock-holding locations when they are genuinely separate.
+     * This helper only collapses obvious duplicate naming patterns such as:
+     * - "Jamuna Future Park" vs "Jamuna Future Park"
+     * - "Main Store (Mirpur)" vs "Mirpur"
+     * - "Store (Bashundhara)" vs "Bashundhara"
+     */
+    private function normalizeOverviewStoreName(string $name): string
+    {
+        $value = strtolower(trim($name));
+        if ($value === '') {
+            return '';
+        }
+
+        $value = html_entity_decode($value, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $value = str_replace(['&'], [' and '], $value);
+        $value = preg_replace('/\s+/', ' ', $value) ?? $value;
+        $value = trim($value);
+
+        // "Main Store (Mirpur)" / "Store (Jamuna Future Park)" -> inner name.
+        if (preg_match('/^(?:main\s+)?store\s*\(([^)]+)\)$/i', $value, $m)) {
+            $value = trim($m[1]);
+        }
+
+        // "Main Store - Mirpur" / "Store: Bashundhara" -> trailing name.
+        if (preg_match('/^(?:main\s+)?store\s*[-:]\s*(.+)$/i', $value, $m)) {
+            $value = trim($m[1]);
+        }
+
+        // "Main Store Mirpur" -> "Mirpur". Keep this intentionally narrow so
+        // true locations like "Mirpur Warehouse" do not collapse into "Mirpur".
+        $value = preg_replace('/^main\s+store\s+/i', '', $value) ?? $value;
+
+        // "Store Bashundhara" -> "Bashundhara". Also intentionally narrow.
+        $value = preg_replace('/^store\s+/i', '', $value) ?? $value;
+
+        // Normalize separators/punctuation after the duplicate-specific cleanup.
+        $value = preg_replace('/[^a-z0-9]+/i', ' ', $value) ?? $value;
+        $value = preg_replace('/\s+/', ' ', $value) ?? $value;
+
+        return trim($value);
+    }
+
+    /**
+     * Return the canonical Inventory View location list plus alias mappings.
+     *
+     * Inventory View must include all active stores/warehouses (offline + online),
+     * but the stores table may contain duplicate records for the same physical
+     * location. The returned alias map lets the metric queries merge stock and
+     * movement from duplicate IDs into the one visible canonical column.
+     */
+    private function overviewCanonicalStoreRows(): array
+    {
+        $rows = DB::table('stores')
+            ->select('id', 'name', 'store_code', 'address', 'is_active', 'is_warehouse', 'is_online')
+            ->whereNull('deleted_at')
+            ->where(function ($q) {
+                $q->where('is_active', true)->orWhereNull('is_active');
+            })
+            ->orderBy('name')
+            ->orderBy('id')
+            ->get();
+
+        $groups = [];
+        foreach ($rows as $row) {
+            $key = $this->normalizeOverviewStoreName($row->name ?? '');
+            if ($key === '') {
+                $key = 'id:' . (int) $row->id;
+            }
+            $groups[$key][] = $row;
+        }
+
+        $canonicalRows = [];
+        $idMap = [];
+        $aliases = [];
+
+        foreach ($groups as $groupRows) {
+            usort($groupRows, function ($a, $b) {
+                // Prefer the configured/code-bearing row (for example MAIN), then
+                // the lowest ID. This keeps stable IDs for filters and URLs.
+                $aHasCode = trim((string) ($a->store_code ?? '')) !== '' ? 0 : 1;
+                $bHasCode = trim((string) ($b->store_code ?? '')) !== '' ? 0 : 1;
+                if ($aHasCode !== $bHasCode) return $aHasCode <=> $bHasCode;
+                return ((int) $a->id) <=> ((int) $b->id);
+            });
+
+            $canonical = $groupRows[0];
+            $canonicalId = (int) $canonical->id;
+            $aliases[$canonicalId] = [];
+
+            foreach ($groupRows as $row) {
+                $sourceId = (int) $row->id;
+                $idMap[$sourceId] = $canonicalId;
+                $aliases[$canonicalId][] = $sourceId;
+            }
+
+            $canonical->alias_store_ids = array_values(array_unique($aliases[$canonicalId]));
+            $canonicalRows[] = $canonical;
+        }
+
+        $stores = collect($canonicalRows)
+            ->sortBy(fn ($row) => strtolower((string) $row->name))
+            ->values();
+
+        return [
+            'stores' => $stores,
+            'id_map' => $idMap,
+            'aliases' => $aliases,
+        ];
+    }
+
+    /**
+     * Backward-compatible helper for older call sites inside this controller.
+     */
+    private function overviewStoreRows(): Collection
+    {
+        return $this->overviewCanonicalStoreRows()['stores'];
+    }
+
+    private function nestedMetricStoreIds(array $map): array
+    {
+        $ids = [];
+        foreach ($map as $byStore) {
+            foreach (array_keys($byStore) as $sid) $ids[] = (int) $sid;
+        }
+        return $ids;
+    }
+
+    private function overviewCurrentStock(array $productIds, array $storeIds = [], array $storeIdMap = [], ?Collection $canonicalStores = null): array
+    {
+        if (empty($productIds)) return [];
+
+        $rows = DB::table('product_batches as pb')
+            ->join('products as p', 'pb.product_id', '=', 'p.id')
+            ->join('stores as s', 'pb.store_id', '=', 's.id')
+            ->whereNull('p.deleted_at')
+            ->where('pb.is_active', true)
+            ->where('pb.quantity', '>', 0)
+            ->whereIn('pb.product_id', $productIds)
+            ->when(!empty($storeIds), fn ($q) => $q->whereIn('pb.store_id', $storeIds))
+            ->select([
+                'pb.product_id',
+                'pb.store_id',
+                's.name as store_name',
+                DB::raw('SUM(pb.quantity) as physical_stock'),
+                DB::raw('COUNT(DISTINCT pb.id) as batches_count'),
+                DB::raw('SUM(pb.quantity * pb.sell_price) as stock_value'),
+            ])
+            ->groupBy('pb.product_id', 'pb.store_id', 's.name')
+            ->get();
+
+        $storeNames = $canonicalStores ? $canonicalStores->keyBy('id')->map(fn ($s) => $s->name)->toArray() : [];
+        $map = [];
+        foreach ($rows as $r) {
+            $productId = (int) $r->product_id;
+            $sourceStoreId = (int) $r->store_id;
+            $storeId = (int) ($storeIdMap[$sourceStoreId] ?? $sourceStoreId);
+            $storeName = $storeNames[$storeId] ?? $r->store_name;
+
+            if (!isset($map[$productId][$storeId])) {
+                $map[$productId][$storeId] = [
+                    'store_name' => $storeName,
+                    'physical_stock' => 0,
+                    'batches_count' => 0,
+                    'stock_value' => 0.0,
+                ];
+            }
+
+            $map[$productId][$storeId]['physical_stock'] += (int) $r->physical_stock;
+            $map[$productId][$storeId]['batches_count'] += (int) $r->batches_count;
+            $map[$productId][$storeId]['stock_value'] = round($map[$productId][$storeId]['stock_value'] + (float) $r->stock_value, 2);
+        }
+        return $map;
+    }
+
+    private function overviewPurchases(array $productIds, Carbon $from, Carbon $to, array $storeIds = [], array $storeIdMap = []): array
+    {
+        if (empty($productIds)) return [];
+
+        $rows = DB::table('purchase_order_items as poi')
+            ->join('purchase_orders as po', 'poi.purchase_order_id', '=', 'po.id')
+            ->leftJoin('product_batches as pb', 'poi.product_batch_id', '=', 'pb.id')
+            ->whereIn('poi.product_id', $productIds)
+            ->whereNotIn('po.status', ['draft', 'cancelled', 'returned'])
+            ->whereBetween(DB::raw('COALESCE(po.actual_delivery_date, po.order_date, po.created_at)'), [$from, $to])
+            ->when(!empty($storeIds), fn ($q) => $q->whereIn(DB::raw('COALESCE(pb.store_id, po.store_id)'), $storeIds))
+            ->select([
+                'poi.product_id',
+                DB::raw('COALESCE(pb.store_id, po.store_id) as store_id'),
+                DB::raw('SUM(CASE WHEN poi.quantity_received > 0 THEN poi.quantity_received ELSE poi.quantity_ordered END) as total_purchase'),
+                DB::raw('COUNT(DISTINCT po.id) as po_count'),
+                DB::raw('GROUP_CONCAT(DISTINCT po.po_number ORDER BY po.po_number SEPARATOR ", ") as po_numbers'),
+            ])
+            ->groupBy('poi.product_id', DB::raw('COALESCE(pb.store_id, po.store_id)'))
+            ->get();
+
+        $map = [];
+        foreach ($rows as $r) {
+            if (!$r->store_id) continue;
+            $productId = (int) $r->product_id;
+            $sourceStoreId = (int) $r->store_id;
+            $storeId = (int) ($storeIdMap[$sourceStoreId] ?? $sourceStoreId);
+            $poNumbers = array_values(array_filter(array_map('trim', explode(',', (string) $r->po_numbers))));
+
+            if (!isset($map[$productId][$storeId])) {
+                $map[$productId][$storeId] = [
+                    'total_purchase' => 0,
+                    'po_count' => 0,
+                    'po_numbers' => [],
+                ];
+            }
+
+            $map[$productId][$storeId]['total_purchase'] += (int) $r->total_purchase;
+            $map[$productId][$storeId]['po_numbers'] = array_values(array_unique(array_merge($map[$productId][$storeId]['po_numbers'], $poNumbers)));
+            $map[$productId][$storeId]['po_count'] = count($map[$productId][$storeId]['po_numbers']);
+        }
+        return $map;
+    }
+
+    private function overviewSales(array $productIds, Carbon $from, Carbon $to, array $storeIds = [], array $storeIdMap = []): array
+    {
+        if (empty($productIds)) return [];
+
+        $rows = DB::table('order_items as oi')
+            ->join('orders as o', 'oi.order_id', '=', 'o.id')
+            ->whereIn('oi.product_id', $productIds)
+            ->whereNull('o.deleted_at')
+            ->whereNotIn('o.status', ['cancelled', 'refunded'])
+            ->whereBetween('o.order_date', [$from, $to])
+            ->when(!empty($storeIds), fn ($q) => $q->whereIn(DB::raw('COALESCE(oi.store_id, o.store_id)'), $storeIds))
+            ->select([
+                'oi.product_id',
+                DB::raw('COALESCE(oi.store_id, o.store_id) as store_id'),
+                DB::raw('SUM(oi.quantity) as total_sell'),
+                DB::raw('SUM(oi.total_amount) as sales_revenue'),
+                DB::raw('COUNT(DISTINCT o.id) as order_count'),
+            ])
+            ->groupBy('oi.product_id', DB::raw('COALESCE(oi.store_id, o.store_id)'))
+            ->get();
+
+        $map = [];
+        foreach ($rows as $r) {
+            if (!$r->store_id) continue;
+            $productId = (int) $r->product_id;
+            $sourceStoreId = (int) $r->store_id;
+            $storeId = (int) ($storeIdMap[$sourceStoreId] ?? $sourceStoreId);
+
+            if (!isset($map[$productId][$storeId])) {
+                $map[$productId][$storeId] = [
+                    'total_sell' => 0,
+                    'sales_revenue' => 0.0,
+                    'order_count' => 0,
+                ];
+            }
+
+            $map[$productId][$storeId]['total_sell'] += (int) $r->total_sell;
+            $map[$productId][$storeId]['sales_revenue'] = round($map[$productId][$storeId]['sales_revenue'] + (float) $r->sales_revenue, 2);
+            $map[$productId][$storeId]['order_count'] += (int) $r->order_count;
+        }
+        return $map;
+    }
+
+    private function overviewDispatchOut(array $productIds, Carbon $from, Carbon $to, array $storeIds = [], array $storeIdMap = []): array
+    {
+        if (empty($productIds)) return [];
+
+        $rows = DB::table('product_dispatch_items as pdi')
+            ->join('product_dispatches as pd', 'pdi.product_dispatch_id', '=', 'pd.id')
+            ->join('product_batches as pb', 'pdi.product_batch_id', '=', 'pb.id')
+            ->whereIn('pb.product_id', $productIds)
+            ->whereNotIn('pd.status', ['cancelled'])
+            ->whereBetween('pd.dispatch_date', [$from, $to])
+            ->when(!empty($storeIds), fn ($q) => $q->whereIn('pd.source_store_id', $storeIds))
+            ->select([
+                'pb.product_id',
+                'pd.source_store_id as store_id',
+                DB::raw('SUM(pdi.quantity) as total_dispatch_out'),
+            ])
+            ->groupBy('pb.product_id', 'pd.source_store_id')
+            ->get();
+
+        $map = [];
+        foreach ($rows as $r) {
+            if (!$r->store_id) continue;
+            $productId = (int) $r->product_id;
+            $sourceStoreId = (int) $r->store_id;
+            $storeId = (int) ($storeIdMap[$sourceStoreId] ?? $sourceStoreId);
+            $map[$productId][$storeId]['total_dispatch_out'] = ($map[$productId][$storeId]['total_dispatch_out'] ?? 0) + (int) $r->total_dispatch_out;
+        }
+        return $map;
+    }
+
+    private function overviewDispatchReceived(array $productIds, Carbon $from, Carbon $to, array $storeIds = [], array $storeIdMap = []): array
+    {
+        if (empty($productIds)) return [];
+
+        $rows = DB::table('product_dispatch_items as pdi')
+            ->join('product_dispatches as pd', 'pdi.product_dispatch_id', '=', 'pd.id')
+            ->join('product_batches as pb', 'pdi.product_batch_id', '=', 'pb.id')
+            ->whereIn('pb.product_id', $productIds)
+            ->whereNotIn('pd.status', ['cancelled'])
+            ->whereBetween(DB::raw('COALESCE(pd.actual_delivery_date, pd.dispatch_date)'), [$from, $to])
+            ->when(!empty($storeIds), fn ($q) => $q->whereIn('pd.destination_store_id', $storeIds))
+            ->select([
+                'pb.product_id',
+                'pd.destination_store_id as store_id',
+                DB::raw("SUM(COALESCE(pdi.received_quantity, CASE WHEN pdi.status = 'received' OR pd.status = 'delivered' THEN pdi.quantity ELSE 0 END)) as total_dispatch_received"),
+            ])
+            ->groupBy('pb.product_id', 'pd.destination_store_id')
+            ->get();
+
+        $map = [];
+        foreach ($rows as $r) {
+            if (!$r->store_id) continue;
+            $productId = (int) $r->product_id;
+            $sourceStoreId = (int) $r->store_id;
+            $storeId = (int) ($storeIdMap[$sourceStoreId] ?? $sourceStoreId);
+            $map[$productId][$storeId]['total_dispatch_received'] = ($map[$productId][$storeId]['total_dispatch_received'] ?? 0) + (int) $r->total_dispatch_received;
+        }
+        return $map;
+    }
+
+    private function overviewDefects(array $productIds, Carbon $from, Carbon $to, array $storeIds = [], array $storeIdMap = []): array
+    {
+        if (empty($productIds)) return [];
+
+        $rows = DB::table('defective_products as dp')
+            ->whereNull('dp.deleted_at')
+            ->whereIn('dp.product_id', $productIds)
+            ->whereBetween(DB::raw('COALESCE(dp.identified_at, dp.created_at)'), [$from, $to])
+            ->when(!empty($storeIds), fn ($q) => $q->whereIn('dp.store_id', $storeIds))
+            ->select([
+                'dp.product_id',
+                'dp.store_id',
+                DB::raw('COUNT(*) as total_defect'),
+            ])
+            ->groupBy('dp.product_id', 'dp.store_id')
+            ->get();
+
+        $map = [];
+        foreach ($rows as $r) {
+            if (!$r->store_id) continue;
+            $productId = (int) $r->product_id;
+            $sourceStoreId = (int) $r->store_id;
+            $storeId = (int) ($storeIdMap[$sourceStoreId] ?? $sourceStoreId);
+            $map[$productId][$storeId]['total_defect'] = ($map[$productId][$storeId]['total_defect'] ?? 0) + (int) $r->total_defect;
+        }
+        return $map;
+    }
+
+    private function canViewInventoryCostPrice(): bool
+    {
+        $user = auth()->user();
+        if (!$user) return false;
+
+        try {
+            $roleSlug = optional($user->role)->slug;
+            return in_array($roleSlug, ['super-admin', 'super_admin', 'superadmin', 'admin'], true);
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    private function overviewBatchDetails(array $productIds, Carbon $from, Carbon $to, array $storeIds = [], array $storeIdMap = [], ?Collection $canonicalStores = null, bool $includeCostPrice = false): Collection
+    {
+        if (empty($productIds)) return collect();
+
+        $rows = DB::table('product_batches as pb')
+            ->join('products as p', 'pb.product_id', '=', 'p.id')
+            ->join('stores as s', 'pb.store_id', '=', 's.id')
+            ->leftJoin('purchase_order_items as poi', 'poi.product_batch_id', '=', 'pb.id')
+            ->leftJoin('purchase_orders as po', 'poi.purchase_order_id', '=', 'po.id')
+            ->leftJoin('vendors as v', 'po.vendor_id', '=', 'v.id')
+            ->whereNull('p.deleted_at')
+            ->where('pb.is_active', true)
+            ->whereIn('pb.product_id', $productIds)
+            ->when(!empty($storeIds), fn ($q) => $q->whereIn('pb.store_id', $storeIds))
+            ->where(function ($q) use ($from, $to) {
+                $q->whereBetween('pb.created_at', [$from, $to])
+                    ->orWhereBetween('po.order_date', [$from, $to])
+                    ->orWhereBetween('po.actual_delivery_date', [$from, $to]);
+            })
+            ->select([
+                'pb.id as batch_id',
+                'pb.batch_number',
+                'pb.product_id',
+                'p.name as product_name',
+                'p.sku as product_sku',
+                'pb.store_id',
+                's.name as store_name',
+                'pb.quantity as remaining_stock',
+                'pb.cost_price',
+                'pb.sell_price',
+                'pb.created_at as batch_created_at',
+                'po.id as po_id',
+                'po.po_number',
+                'po.order_date as po_order_date',
+                'po.actual_delivery_date as po_received_date',
+                'po.status as po_status',
+                'v.name as vendor_name',
+                'poi.quantity_ordered',
+                'poi.quantity_received as po_qty_received',
+            ])
+            ->orderByDesc(DB::raw('COALESCE(po.actual_delivery_date, po.order_date, pb.created_at)'))
+            ->limit(2000)
+            ->get();
+
+        if ($rows->isEmpty()) return collect();
+
+        $batchIds = $rows->pluck('batch_id')->unique()->values()->toArray();
+
+        $salesPerBatch = DB::table('order_items as oi')
+            ->join('orders as o', 'oi.order_id', '=', 'o.id')
+            ->whereNull('o.deleted_at')
+            ->whereNotIn('o.status', ['cancelled', 'refunded'])
+            ->whereIn('oi.product_batch_id', $batchIds)
+            ->whereBetween('o.order_date', [$from, $to])
+            ->select([
+                'oi.product_batch_id as batch_id',
+                DB::raw('SUM(oi.quantity) as units_sold'),
+                DB::raw('SUM(oi.total_amount) as revenue'),
+                DB::raw('COUNT(DISTINCT o.id) as order_count'),
+            ])
+            ->groupBy('oi.product_batch_id')
+            ->get()
+            ->keyBy('batch_id');
+
+        $storeNames = $canonicalStores ? $canonicalStores->keyBy('id')->map(fn ($s) => $s->name)->toArray() : [];
+
+        return $rows->map(function ($batch) use ($salesPerBatch, $from, $includeCostPrice, $storeIdMap, $storeNames) {
+            $sales = $salesPerBatch->get($batch->batch_id);
+            $unitsSold = $sales ? (int) $sales->units_sold : 0;
+            $originalQty = $batch->po_qty_received ?: ((int) $batch->remaining_stock + $unitsSold);
+            $receivedAt = $batch->po_received_date ?: $batch->batch_created_at;
+            $daysSinceReceived = $receivedAt ? Carbon::parse($receivedAt)->diffInDays(Carbon::now()) : null;
+            $velocity = $daysSinceReceived && $daysSinceReceived > 0 ? round($unitsSold / $daysSinceReceived, 4) : 0.0;
+            $daysOfStock = $velocity > 0 ? round(((int) $batch->remaining_stock) / $velocity, 1) : null;
+
+            $sourceStoreId = (int) $batch->store_id;
+            $canonicalStoreId = (int) ($storeIdMap[$sourceStoreId] ?? $sourceStoreId);
+
+            return [
+                'batch_id' => (int) $batch->batch_id,
+                'batch_number' => $batch->batch_number,
+                'product_id' => (int) $batch->product_id,
+                'product_name' => $batch->product_name,
+                'product_sku' => $batch->product_sku,
+                'store_id' => $canonicalStoreId,
+                'store_name' => $storeNames[$canonicalStoreId] ?? $batch->store_name,
+                'po_id' => $batch->po_id ? (int) $batch->po_id : null,
+                'po_number' => $batch->po_number,
+                'po_order_date' => $batch->po_order_date,
+                'po_received_date' => $batch->po_received_date,
+                'po_status' => $batch->po_status,
+                'vendor_name' => $batch->vendor_name,
+                'original_qty' => (int) $originalQty,
+                'remaining_stock' => (int) $batch->remaining_stock,
+                'cost_price' => $includeCostPrice ? round((float) $batch->cost_price, 2) : null,
+                'sell_price' => round((float) $batch->sell_price, 2),
+                'units_sold' => $unitsSold,
+                'order_count' => $sales ? (int) $sales->order_count : 0,
+                'revenue' => $sales ? round((float) $sales->revenue, 2) : 0.0,
+                'sell_through_pct' => $originalQty > 0 ? round(($unitsSold / $originalQty) * 100, 1) : 0.0,
+                'days_since_received' => $daysSinceReceived,
+                'velocity_per_day' => $velocity,
+                'days_of_stock' => $daysOfStock,
+                'stock_value' => round(((int) $batch->remaining_stock) * (float) $batch->sell_price, 2),
+            ];
+        })->values();
+    }
+
+    private function overviewStockStatus(int $stock, float $velocity, ?float $daysOfCover, int $soldQty): string
+    {
+        if ($stock <= 0 && $soldQty > 0) return 'out_of_stock';
+        if ($stock <= 0) return 'no_stock';
+        if ($velocity <= 0) return 'slow_moving';
+        if ($daysOfCover !== null && $daysOfCover < 15) return 'low';
+        if ($daysOfCover !== null && $daysOfCover > 60) return 'high';
+        return 'normal';
+    }
+
+    private function overviewProductStatus(array $stores, int $stock, float $velocity, ?float $daysOfCover): string
+    {
+        if ($stock <= 0 && $velocity > 0) return 'out_of_stock';
+        if (collect($stores)->contains(fn($s) => in_array($s['stock_status'], ['low', 'out_of_stock'], true))) return 'low';
+        if ($stock > 0 && $velocity <= 0) return 'slow_moving';
+        if (collect($stores)->contains(fn($s) => in_array($s['stock_status'], ['high', 'slow_moving'], true))) return 'high';
+        return 'normal';
+    }
+
+    private function overviewMovementRecommendation(array $stores, int $periodDays): ?array
+    {
+        if (count($stores) < 2) return null;
+
+        $targetCoverDays = 30;
+        $donorKeepDays = 30;
+        $lowStores = [];
+        $highStores = [];
+
+        foreach ($stores as $store) {
+            $stock = (int) $store['current_stock'];
+            $velocity = (float) $store['velocity_per_day'];
+            $days = $store['days_of_cover'];
+
+            if ($velocity > 0 && ($days === null || $days < 15)) {
+                $targetStock = (int) ceil($velocity * $targetCoverDays);
+                $need = max(1, $targetStock - $stock);
+                $lowStores[] = array_merge($store, ['need_qty' => $need]);
+            }
+
+            if ($stock > 0) {
+                $keep = $velocity > 0 ? (int) ceil($velocity * $donorKeepDays) : 0;
+                $excess = max(0, $stock - $keep);
+                if ($excess > 0 && ($velocity == 0.0 || $days === null || $days > 45)) {
+                    $highStores[] = array_merge($store, ['excess_qty' => $excess]);
+                }
+            }
+        }
+
+        if (empty($lowStores) || empty($highStores)) return null;
+
+        usort($lowStores, fn($a, $b) => $b['need_qty'] <=> $a['need_qty']);
+        usort($highStores, fn($a, $b) => $b['excess_qty'] <=> $a['excess_qty']);
+
+        $receiver = $lowStores[0];
+        foreach ($highStores as $donor) {
+            if ((int) $donor['store_id'] === (int) $receiver['store_id']) continue;
+            $qty = min((int) $donor['excess_qty'], (int) $receiver['need_qty']);
+            if ($qty < 1) continue;
+
+            $urgency = $receiver['stock_status'] === 'out_of_stock' ? 'urgent' : ((float) $receiver['days_of_cover'] < 7 ? 'high' : 'medium');
+            return [
+                'type' => 'store_transfer',
+                'urgency' => $urgency,
+                'from_store_id' => (int) $donor['store_id'],
+                'from_store_name' => $donor['store_name'],
+                'from_store_stock' => (int) $donor['current_stock'],
+                'from_store_days_of_cover' => $donor['days_of_cover'],
+                'to_store_id' => (int) $receiver['store_id'],
+                'to_store_name' => $receiver['store_name'],
+                'to_store_stock' => (int) $receiver['current_stock'],
+                'to_store_days_of_cover' => $receiver['days_of_cover'],
+                'suggested_quantity' => $qty,
+                'reason' => "{$receiver['store_name']} has low cover while {$donor['store_name']} has excess/slow stock.",
+            ];
+        }
+
+        return null;
+    }
+
+    // =========================================================================
+    // Private helpers for endpoint 1 (product-level)
+    // =========================================================================
+
+    private function getPerStoreSalesVelocity(Carbon $from, Carbon $to, $filterStore = null): Collection
+    {
+        $query = DB::table('order_items')
+            ->join('orders',   'order_items.order_id',   '=', 'orders.id')
+            ->join('products', 'order_items.product_id', '=', 'products.id')
+            ->whereNull('orders.deleted_at')
+            ->whereNull('products.deleted_at')
+            ->whereNotIn('orders.status', ['cancelled', 'refunded'])
+            ->whereBetween('orders.order_date', [$from, $to])
+            ->select([
+                'order_items.product_id',
+                'orders.store_id',
+                DB::raw('COALESCE(order_items.product_name, products.name) as product_name'),
+                DB::raw('COALESCE(order_items.product_sku, products.sku) as sku'),
+                DB::raw('SUM(order_items.quantity) as units_sold'),
+                DB::raw('SUM(order_items.total_amount) as revenue'),
+                DB::raw('SUM(order_items.cogs) as cogs'),
+            ])
+            ->groupBy('order_items.product_id', 'orders.store_id', 'order_items.product_name', 'order_items.product_sku', 'products.name', 'products.sku');
+
+        if ($filterStore) $query->where('orders.store_id', $filterStore);
+
+        return $query->get();
+    }
+
+    private function getCurrentStockPerStore($filterStore = null): Collection
+    {
+        $query = DB::table('product_batches')
+            ->join('products', 'product_batches.product_id', '=', 'products.id')
+            ->join('stores',   'product_batches.store_id',   '=', 'stores.id')
+            ->whereNull('products.deleted_at')
+            ->where('product_batches.is_active', true)
+            ->where('product_batches.quantity', '>', 0)
+            ->select([
+                'product_batches.product_id',
+                'product_batches.store_id',
+                'products.name as product_name',
+                'products.sku as sku',
+                'stores.name as store_name',
+                DB::raw('SUM(product_batches.quantity) as quantity'),
+                DB::raw('MIN(product_batches.id) as batch_id'),
+                DB::raw('AVG(product_batches.cost_price) as cost_price'),
+                DB::raw('AVG(product_batches.sell_price) as sell_price'),
+            ])
+            ->groupBy('product_batches.product_id', 'product_batches.store_id', 'products.name', 'products.sku', 'stores.name');
+
+        if ($filterStore) $query->where('product_batches.store_id', $filterStore);
+
+        return $query->get();
+    }
+
+    private function buildMaps(Collection $salesRows, Collection $stockRows): array
+    {
+        $productMap = [];
+        $storeMap   = [];
+
+        foreach ($stockRows as $row) $storeMap[$row->store_id] = $row->store_name;
+        foreach ($salesRows as $row) { if (!isset($storeMap[$row->store_id])) $storeMap[$row->store_id] = 'Store ' . $row->store_id; }
+
+        foreach ($stockRows as $row) {
+            $pid = $row->product_id; $sid = $row->store_id;
+            if (!isset($productMap[$pid])) {
+                $productMap[$pid] = ['product_id' => $pid, 'product_name' => $row->product_name, 'sku' => $row->sku, 'stores' => []];
+            }
+            $productMap[$pid]['stores'][$sid] = ['store_id' => $sid, 'store_name' => $row->store_name, 'stock' => (int)$row->quantity, 'batch_id' => (int)$row->batch_id, 'cost_price' => (float)$row->cost_price, 'sell_price' => (float)$row->sell_price, 'units_sold' => 0, 'revenue' => 0.0, 'velocity' => 0.0, 'days_of_stock' => null];
+        }
+
+        foreach ($salesRows as $row) {
+            $pid = $row->product_id; $sid = $row->store_id;
+            if (!isset($productMap[$pid])) $productMap[$pid] = ['product_id' => $pid, 'product_name' => $row->product_name, 'sku' => $row->sku, 'stores' => []];
+            if (!isset($productMap[$pid]['stores'][$sid])) $productMap[$pid]['stores'][$sid] = ['store_id' => $sid, 'store_name' => $storeMap[$sid] ?? 'Store '.$sid, 'stock' => 0, 'batch_id' => null, 'cost_price' => 0.0, 'sell_price' => 0.0, 'units_sold' => 0, 'revenue' => 0.0, 'velocity' => 0.0, 'days_of_stock' => null];
+            $productMap[$pid]['stores'][$sid]['units_sold'] = (int)$row->units_sold;
+            $productMap[$pid]['stores'][$sid]['revenue']    = round((float)$row->revenue, 2);
+        }
+
+        return [$productMap, $storeMap];
+    }
+
+    private function computeIntelligence(array $productMap, array $storeMap, int $days, int $minGap): array
+    {
+        $recommendations = []; $bestSellers = []; $slowMovers = []; $crossStoreStars = [];
+
+        foreach ($productMap as $pid => $product) {
+            $stores = $product['stores'];
+            if (count($stores) < 1) continue;
+
+            foreach ($stores as $sid => &$sd) {
+                $vel = $days > 0 ? round($sd['units_sold'] / $days, 4) : 0;
+                $sd['velocity'] = $vel;
+                $sd['days_of_stock'] = $vel > 0 && $sd['stock'] > 0 ? round($sd['stock'] / $vel) : ($sd['stock'] > 0 ? 999 : 0);
+            } unset($sd);
+
+            $totalUnits = array_sum(array_column($stores, 'units_sold'));
+            $bestSellers[] = ['product_id' => $pid, 'product_name' => $product['product_name'], 'sku' => $product['sku'], 'total_units' => $totalUnits, 'total_revenue' => round(array_sum(array_column($stores, 'revenue')), 2), 'total_stock' => array_sum(array_column($stores, 'stock')), 'by_store' => array_values($stores)];
+
+            $hasStock = array_filter($stores, fn($s) => $s['stock'] > 0);
+            $noSaleStores = array_filter($hasStock, fn($s) => $s['units_sold'] === 0);
+            if (count($noSaleStores) > 0 && count($hasStock) > 0) {
+                $dead = array_sum(array_column(array_values($noSaleStores), 'stock'));
+                if ($dead >= $minGap) $slowMovers[] = ['product_id' => $pid, 'product_name' => $product['product_name'], 'sku' => $product['sku'], 'dead_stock' => $dead, 'affected_stores' => array_values(array_map(fn($s) => ['store_id' => $s['store_id'], 'store_name' => $s['store_name'], 'stock' => $s['stock']], $noSaleStores))];
+            }
+
+            if (count($stores) < 2) continue;
+            $storeList = array_values($stores);
+            usort($storeList, fn($a, $b) => $b['velocity'] <=> $a['velocity']);
+            $top = $storeList[0]; $bottom = $storeList[count($storeList) - 1];
+
+            if ($bottom['stock'] < $minGap) continue;
+            if ($bottom['stock'] <= $top['stock'] && $top['stock'] > 0 && abs($top['velocity'] - $bottom['velocity']) < 0.01) continue;
+
+            $velGap = $top['velocity'] - $bottom['velocity'];
+            if ($velGap > 0.001) {
+                $target = max($minGap, (int) round($velGap * min($days, 30) * 0.5));
+            } else {
+                $avg = array_sum(array_column($storeList, 'stock')) / count($storeList);
+                $target = max($minGap, (int) floor(max(0, $bottom['stock'] - $avg) * 0.5));
+            }
+            $target = min($target, (int) floor($bottom['stock'] * 0.7));
+            if ($target < $minGap) continue;
+
+            $dos = $top['days_of_stock'] ?? 999;
+            $score = round(($top['velocity'] * 10) + ($dos < 999 ? max(0, 100 - $dos) : 0) + ($bottom['days_of_stock'] === 999 ? 20 : 0) + ($velGap > 0.01 ? 15 : ($totalUnits === 0 ? 10 : 5)), 1);
+            $urgency = $score >= 60 ? 'urgent' : ($score >= 35 ? 'high' : ($score >= 15 ? 'medium' : 'low'));
+
+            if ($bottom['units_sold'] === 0 && $top['velocity'] > 0) $crossStoreStars[] = ['product_id' => $pid, 'product_name' => $product['product_name'], 'sku' => $product['sku'], 'hot_store_id' => $top['store_id'], 'hot_store_name' => $top['store_name'], 'hot_store_velocity' => $top['velocity'], 'dead_store_id' => $bottom['store_id'], 'dead_store_name' => $bottom['store_name'], 'dead_store_stock' => $bottom['stock']];
+
+            $recommendations[] = ['product_id' => $pid, 'product_name' => $product['product_name'], 'sku' => $product['sku'], 'urgency' => $urgency, 'urgency_score' => $score, 'from_store_id' => $bottom['store_id'], 'from_store_name' => $bottom['store_name'], 'from_store_stock' => $bottom['stock'], 'from_store_velocity' => $bottom['velocity'], 'from_store_batch_id' => $bottom['batch_id'], 'to_store_id' => $top['store_id'], 'to_store_name' => $top['store_name'], 'to_store_stock' => $top['stock'], 'to_store_velocity' => $top['velocity'], 'to_store_days_remaining' => $dos === 999 ? null : $dos, 'suggested_quantity' => $target, 'reason' => $velGap > 0.001 ? "{$top['store_name']} sells " . number_format($top['velocity'], 3) . " u/day vs {$bottom['store_name']}'s " . number_format($bottom['velocity'], 3) . " u/day." . ($bottom['units_sold'] === 0 ? " {$bottom['store_name']} had zero sales." : '') : "{$bottom['store_name']} has {$bottom['stock']} units idle while {$top['store_name']} has {$top['stock']} units.", 'estimated_value' => round($target * (float)($top['sell_price'] ?: $bottom['sell_price']), 2), 'all_stores' => $storeList];
+        }
+
+        usort($recommendations, fn($a, $b) => $b['urgency_score'] <=> $a['urgency_score']);
+        usort($bestSellers,     fn($a, $b) => $b['total_units']   <=> $a['total_units']);
+        usort($slowMovers,      fn($a, $b) => $b['dead_stock']     <=> $a['dead_stock']);
+
+        return ['recommendations' => array_slice($recommendations, 0, 50), 'best_sellers' => array_slice($bestSellers, 0, 20), 'slow_movers' => array_slice($slowMovers, 0, 20), 'cross_store_stars' => array_slice($crossStoreStars, 0, 20)];
+    }
+
+    private function buildBranchSummary(Collection $salesRows, Collection $stockRows, array $storeMap, int $days): array
+    {
+        $summary = [];
+        foreach ($storeMap as $sid => $storeName) {
+            $ss = $salesRows->where('store_id', $sid);
+            $sr = $stockRows->where('store_id',  $sid);
+            $stockSkus = $sr->pluck('product_id')->unique();
+            $soldSkus  = $ss->pluck('product_id')->unique();
+            $summary[] = ['store_id' => (int)$sid, 'store_name' => $storeName, 'units_sold' => (int)$ss->sum('units_sold'), 'revenue' => round((float)$ss->sum('revenue'), 2), 'velocity_day' => $days > 0 ? round((int)$ss->sum('units_sold') / $days, 2) : 0, 'total_stock' => (int)$sr->sum('quantity'), 'sku_count' => $stockSkus->count(), 'dead_sku_count' => $stockSkus->diff($soldSkus)->count(), 'stock_value' => round((float)$sr->sum(fn($r) => $r->cost_price * $r->quantity), 2)];
+        }
+        usort($summary, fn($a, $b) => $b['revenue'] <=> $a['revenue']);
+        return $summary;
+    }
+
+    private function emptyBatchSummary(): array
+    {
+        return ['total_products' => 0, 'total_batches' => 0, 'total_pos' => 0, 'total_original' => 0, 'total_remaining' => 0, 'total_sold' => 0, 'total_revenue' => 0, 'total_profit' => 0, 'total_stock_value' => 0, 'overall_sell_through' => 0.0];
+    }
+}
